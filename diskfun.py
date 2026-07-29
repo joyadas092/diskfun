@@ -1017,11 +1017,23 @@ async def start_mtproto_reader() -> None:
         no_updates=True,
     )
     await mtproto_app.start()
-    try:
-        await mtproto_app.get_chat(parse_chat_id(LIBRARY_TELEGRAM_CHANNEL))
-    except Exception as exc:
-        logger.warning("Could not pre-resolve library channel: %s", exc)
-    logger.info("MTProto reader started in memory; no session file will be created.")
+
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            await mtproto_app.get_chat(parse_chat_id(LIBRARY_TELEGRAM_CHANNEL))
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("Peer resolve attempt %s/5 failed: %s", attempt + 1, exc)
+            await asyncio.sleep(2 * (attempt + 1))
+
+    if last_exc is not None:
+        await mtproto_app.stop()
+        raise RuntimeError(f"Could not resolve library channel peer after 5 attempts: {last_exc}")
+
+    logger.info("MTProto reader started in memory; library channel peer resolved.")
 
 
 async def main() -> None:
