@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import re
+import signal
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -30,6 +31,21 @@ logger = logging.getLogger("viralbot")
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0") or 0)
+
+
+def parse_owner_ids() -> set[int]:
+    ids: set[int] = set()
+    if OWNER_CHAT_ID:
+        ids.add(OWNER_CHAT_ID)
+    raw = os.getenv("OWNER_CHAT_IDS", "").strip()
+    for part in re.split(r"[,;\s]+", raw):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            ids.add(int(part))
+    return ids
+
+
+OWNER_CHAT_IDS = parse_owner_ids()
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 
@@ -105,20 +121,26 @@ class TelegramBotAPI:
         if self.session:
             await self.session.close()
 
-    async def request(self, method: str, payload: dict | None = None) -> Any:
+    async def request(self, method: str, payload: dict | None = None, _retries: int = 3) -> Any:
         if self.session is None:
             raise RuntimeError("Telegram session is not open")
 
-        async with self.session.post(f"{self.base_url}/{method}", json=payload or {}) as resp:
-            data = await resp.json(content_type=None)
-            if data.get("ok"):
-                return data.get("result")
-            raise TelegramAPIError(
-                method=method,
-                status=int(data.get("error_code") or resp.status),
-                description=str(data.get("description") or "Telegram API error"),
-                parameters=data.get("parameters") or {},
-            )
+        for attempt in range(_retries + 1):
+            async with self.session.post(f"{self.base_url}/{method}", json=payload or {}) as resp:
+                data = await resp.json(content_type=None)
+                if data.get("ok"):
+                    return data.get("result")
+                exc = TelegramAPIError(
+                    method=method,
+                    status=int(data.get("error_code") or resp.status),
+                    description=str(data.get("description") or "Telegram API error"),
+                    parameters=data.get("parameters") or {},
+                )
+            if exc.status == 429 and exc.retry_after and attempt < _retries:
+                logger.info("Rate limited on %s, retrying after %ss", method, exc.retry_after)
+                await asyncio.sleep(exc.retry_after)
+                continue
+            raise exc
 
 
 def utc_now() -> str:
@@ -735,7 +757,7 @@ async def run_broadcast(api: TelegramBotAPI, admin_chat_id: int, status_message_
 async def start_broadcast(api: TelegramBotAPI, message: dict) -> None:
     chat_id = int(message["chat"]["id"])
     user_id = int((message.get("from") or {}).get("id") or 0)
-    if user_id != OWNER_CHAT_ID:
+    if user_id not in OWNER_CHAT_IDS:
         return
 
     if broadcast_jobs:
@@ -782,7 +804,7 @@ async def handle_callback(api: TelegramBotAPI, callback: dict) -> None:
         return
 
     if data.startswith("cancel_broadcast:"):
-        if int(user.get("id") or 0) != OWNER_CHAT_ID:
+        if int(user.get("id") or 0) not in OWNER_CHAT_IDS:
             if callback_id:
                 await api.request("answerCallbackQuery", {
                     "callback_query_id": callback_id,
@@ -834,7 +856,7 @@ async def handle_message(api: TelegramBotAPI, message: dict) -> None:
         await send_earn_channel(api, int(message["chat"]["id"]))
     elif cmd == "broadcast":
         await start_broadcast(api, message)
-    elif cmd == "setmax" and from_user_id == OWNER_CHAT_ID:
+    elif cmd == "setmax" and from_user_id in OWNER_CHAT_IDS:
         payload = command_payload(text)
         if not payload.isdigit() or int(payload) <= 0:
             await api.request("sendMessage", {
@@ -847,7 +869,12 @@ async def handle_message(api: TelegramBotAPI, message: dict) -> None:
             "chat_id": int(message["chat"]["id"]),
             "text": f"✅ Library max message id saved: {int(payload)}",
         })
-    elif cmd == "stats" and from_user_id == OWNER_CHAT_ID:
+    elif cmd == "status" and from_user_id in OWNER_CHAT_IDS:
+        await api.request("sendMessage", {
+            "chat_id": int(message["chat"]["id"]),
+            "text": f"📊 Users started for @{BOT_USERNAME or BOT_KEY}: {await count_users_for_this_bot()}",
+        })
+    elif cmd == "stats" and from_user_id in OWNER_CHAT_IDS:
         await api.request("sendMessage", {
             "chat_id": int(message["chat"]["id"]),
             "text": (
@@ -855,6 +882,16 @@ async def handle_message(api: TelegramBotAPI, message: dict) -> None:
                 f"🔢 Library max id: {await get_max_library_message_id()}"
             ),
         })
+
+
+def extract_update_user_id(update: dict) -> int:
+    message = update.get("message") or update.get("edited_message") or {}
+    if message:
+        return int((message.get("from") or {}).get("id") or 0)
+    callback = update.get("callback_query") or {}
+    if callback:
+        return int((callback.get("from") or {}).get("id") or 0)
+    return 0
 
 
 async def process_update(api: TelegramBotAPI, update: dict) -> None:
@@ -869,6 +906,11 @@ async def process_update(api: TelegramBotAPI, update: dict) -> None:
             await handle_message(api, update["message"])
     except TelegramAPIError as exc:
         logger.warning("Telegram API error in update %s: %s", update.get("update_id"), exc.description)
+        if should_delete_user_after_failure(exc):
+            user_id = extract_update_user_id(update)
+            if user_id:
+                await remove_user_for_this_bot(user_id)
+                logger.info("Removed blocked/deactivated user %s from db", user_id)
     except Exception:
         logger.exception("Unhandled update error: %s", update.get("update_id"))
 
@@ -885,12 +927,11 @@ async def resolve_bot_identity(api: TelegramBotAPI) -> None:
 
 
 async def notify_owner(api: TelegramBotAPI, text: str) -> None:
-    if not OWNER_CHAT_ID:
-        return
-    try:
-        await api.request("sendMessage", {"chat_id": OWNER_CHAT_ID, "text": text})
-    except TelegramAPIError as exc:
-        logger.warning("Owner notify failed: %s", exc.description)
+    for owner_id in OWNER_CHAT_IDS:
+        try:
+            await api.request("sendMessage", {"chat_id": owner_id, "text": text})
+        except TelegramAPIError as exc:
+            logger.warning("Owner notify failed for %s: %s", owner_id, exc.description)
 
 
 async def start_health_server() -> aiohttp.web.AppRunner:
@@ -936,6 +977,22 @@ async def main() -> None:
     api = TelegramBotAPI(BOT_TOKEN)
     await api.open()
     health_runner = await start_health_server()
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _request_stop() -> None:
+        if not stop_event.is_set():
+            logger.info("Shutdown signal received.")
+            stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except (NotImplementedError, RuntimeError):
+            pass  # e.g. Windows, which lacks add_signal_handler support
+
+    crashed_exc: Exception | None = None
     try:
         await resolve_bot_identity(api)
         await start_mtproto_reader()
@@ -944,7 +1001,7 @@ async def main() -> None:
         await notify_owner(api, f"✅ @{BOT_USERNAME or BOT_KEY} started. No session file used.")
 
         offset = 0
-        while True:
+        while not stop_event.is_set():
             try:
                 updates = await api.request("getUpdates", {
                     "offset": offset,
@@ -953,7 +1010,7 @@ async def main() -> None:
                 })
                 for update in updates:
                     offset = max(offset, int(update["update_id"]) + 1)
-                    await process_update(api, update)
+                    asyncio.create_task(process_update(api, update))
             except TelegramAPIError as exc:
                 if exc.retry_after:
                     await asyncio.sleep(exc.retry_after)
@@ -963,13 +1020,22 @@ async def main() -> None:
             except aiohttp.ClientError as exc:
                 logger.warning("Network error: %s", exc)
                 await asyncio.sleep(3)
+    except Exception as exc:
+        crashed_exc = exc
+        logger.exception("Bot crashed and is not responding")
     finally:
+        if crashed_exc is not None:
+            await notify_owner(api, f"🛑 @{BOT_USERNAME or BOT_KEY} crashed and is not responding: {crashed_exc}")
+        else:
+            await notify_owner(api, f"⏹ @{BOT_USERNAME or BOT_KEY} is stopping.")
         if mtproto_app:
             await mtproto_app.stop()
         await api.close()
         await health_runner.cleanup()
         if mongo_client:
             mongo_client.close()
+        if crashed_exc is not None:
+            raise crashed_exc
 
 
 if __name__ == "__main__":
