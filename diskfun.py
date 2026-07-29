@@ -109,10 +109,45 @@ class TelegramAPIError(Exception):
         return int(self.parameters.get("retry_after") or 0)
 
 
+# Methods that don't send anything to a chat (or, for getUpdates, block on Telegram's
+# own long-poll) and so should bypass send throttling entirely.
+UNTHROTTLED_METHODS = {"getUpdates", "getMe", "deleteWebhook", "getChatMember"}
+
+# Telegram's real caps are ~30 msg/sec bot-wide and ~1 msg/sec per chat. Stay a bit
+# under both so we pace requests up front instead of tripping 429s and paying
+# whatever retry_after Telegram hands back.
+GLOBAL_RATE_PER_SEC = 25
+GLOBAL_BUCKET_CAPACITY = 20
+PER_CHAT_MIN_INTERVAL = 1.05
+
+
+class _TokenBucket:
+    def __init__(self, rate: float, capacity: float):
+        self.rate = rate
+        self.capacity = capacity
+        self.tokens = capacity
+        self.updated = time.monotonic()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self.lock:
+            while True:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                await asyncio.sleep((1 - self.tokens) / self.rate)
+
+
 class TelegramBotAPI:
     def __init__(self, token: str):
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.session: aiohttp.ClientSession | None = None
+        self._global_bucket = _TokenBucket(GLOBAL_RATE_PER_SEC, GLOBAL_BUCKET_CAPACITY)
+        self._chat_last_sent: dict[str, float] = {}
+        self._chat_locks: dict[str, asyncio.Lock] = {}
 
     async def open(self) -> None:
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
@@ -121,11 +156,29 @@ class TelegramBotAPI:
         if self.session:
             await self.session.close()
 
+    async def _throttle(self, method: str, payload: dict | None) -> None:
+        if method in UNTHROTTLED_METHODS:
+            return
+        await self._global_bucket.acquire()
+
+        chat_id = (payload or {}).get("chat_id")
+        if chat_id is None:
+            return
+        key = str(chat_id)
+        lock = self._chat_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            now = time.monotonic()
+            wait = PER_CHAT_MIN_INTERVAL - (now - self._chat_last_sent.get(key, 0.0))
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._chat_last_sent[key] = time.monotonic()
+
     async def request(self, method: str, payload: dict | None = None, _retries: int = 3) -> Any:
         if self.session is None:
             raise RuntimeError("Telegram session is not open")
 
         for attempt in range(_retries + 1):
+            await self._throttle(method, payload)
             async with self.session.post(f"{self.base_url}/{method}", json=payload or {}) as resp:
                 data = await resp.json(content_type=None)
                 if data.get("ok"):
@@ -558,6 +611,13 @@ def is_retryable_missing_message(exc: TelegramAPIError) -> bool:
     )
 
 
+async def send_typing_action(api: TelegramBotAPI, chat_id: int) -> None:
+    try:
+        await api.request("sendChatAction", {"chat_id": chat_id, "action": "typing"}, _retries=0)
+    except TelegramAPIError:
+        pass
+
+
 async def send_random_video(api: TelegramBotAPI, chat_id: int, user: dict | None = None) -> None:
     if user:
         await save_user(user)
@@ -588,7 +648,7 @@ async def send_random_video(api: TelegramBotAPI, chat_id: int, user: dict | None
         })
         return
 
-    await api.request("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+    asyncio.create_task(send_typing_action(api, chat_id))
 
     for _ in range(max(1, RANDOM_VIDEO_RETRIES)):
         message_id = random.randint(1, max_message_id)
