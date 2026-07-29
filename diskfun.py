@@ -1021,6 +1021,16 @@ async def start_mtproto_reader() -> None:
     last_exc: Exception | None = None
     for attempt in range(5):
         try:
+            # no_updates=True means this session never passively learns peer access_hash
+            # from live updates. For a private channel known only by numeric id, crawling
+            # dialogs once is the only way to prime Pyrogram's peer cache before get_chat
+            # can resolve it by id (fresh in_memory session, so this repeats every deploy).
+            try:
+                async for _ in mtproto_app.get_dialogs():
+                    pass
+            except Exception as dialog_exc:
+                logger.warning("Dialog crawl failed (continuing): %s", dialog_exc)
+
             await mtproto_app.get_chat(parse_chat_id(LIBRARY_TELEGRAM_CHANNEL))
             last_exc = None
             break
