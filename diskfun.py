@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import logging
 import os
 import random
 import re
 import signal
+import struct
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -1028,6 +1030,21 @@ async def start_health_server() -> aiohttp.web.AppRunner:
 
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
+# Matches pyrogram.storage.storage.Storage.SESSION_STRING_FORMAT ('>BI?256sQ?').
+# base64.urlsafe_b64decode silently drops invalid characters instead of raising,
+# so a session string mangled by copy/paste (stray quotes, whitespace, a dropped
+# line) decodes short instead of erroring - checking the byte length up front
+# catches that before it reaches pyrogram's struct.unpack and crashes the boot.
+_SESSION_STRING_BYTES = struct.calcsize(">BI?256sQ?")
+
+
+def is_valid_session_string(value: str) -> bool:
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        return len(base64.urlsafe_b64decode(padded)) == _SESSION_STRING_BYTES
+    except Exception:
+        return False
+
 
 async def start_mtproto_reader() -> None:
     global mtproto_app
@@ -1042,15 +1059,23 @@ async def start_mtproto_reader() -> None:
         # so it must stay False for the library channel to ever become resolvable.
         no_updates=False,
     )
-    if SESSION_STRING:
-        client_kwargs["session_string"] = SESSION_STRING
-        client_kwargs["in_memory"] = True
+    client_kwargs["in_memory"] = True
+    session_string = SESSION_STRING
+    if session_string and not is_valid_session_string(session_string):
+        logger.warning(
+            "SESSION_STRING is malformed (wrong decoded length) - ignoring it and "
+            "starting a fresh login instead. Re-copy it carefully (no quotes, no "
+            "extra whitespace/line breaks) from /exportsession and reset the env var."
+        )
+        session_string = ""
+
+    if session_string:
+        client_kwargs["session_string"] = session_string
     else:
         logger.warning(
-            "SESSION_STRING is not set. The MTProto peer cache will not survive a "
-            "restart/redeploy; once resolved, use /exportsession to save it."
+            "SESSION_STRING is not set or invalid. The MTProto peer cache will not "
+            "survive a restart/redeploy; once resolved, use /exportsession to save it."
         )
-        client_kwargs["in_memory"] = True
 
     mtproto_app = Client("viralbot_reader", **client_kwargs)
     await mtproto_app.start()
@@ -1152,7 +1177,10 @@ async def main() -> None:
         else:
             await notify_owner(api, f"⏹ @{BOT_USERNAME or BOT_KEY} is stopping.")
         if mtproto_app:
-            await mtproto_app.stop()
+            try:
+                await mtproto_app.stop()
+            except Exception as exc:
+                logger.warning("MTProto client stop failed (continuing cleanup): %s", exc)
         await api.close()
         await health_runner.cleanup()
         if mongo_client:
