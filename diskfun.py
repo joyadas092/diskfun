@@ -1,19 +1,28 @@
 import asyncio
-import base64
 import logging
 import os
 import random
 import re
 import signal
-import struct
 import time
 from datetime import datetime, timezone
 from typing import Any
 
-import aiohttp
 import aiohttp.web
 from dotenv import load_dotenv
-from pyrogram import Client
+from telethon import TelegramClient, Button, events
+from telethon.errors import (
+    ChatAdminRequiredError,
+    ChatWriteForbiddenError,
+    FloodWaitError,
+    InputUserDeactivatedError,
+    PeerIdInvalidError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
+    UserIdInvalidError,
+    UserIsBlockedError,
+    UserNotParticipantError,
+)
 
 try:
     from motor.motor_asyncio import AsyncIOMotorClient
@@ -51,8 +60,6 @@ OWNER_CHAT_IDS = parse_owner_ids()
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 
-# Kept in .env for older Pyrogram bots, but this bot intentionally does not use
-# API_ID/API_HASH or create a Telegram session file.
 LIBRARY_TELEGRAM_CHANNEL = os.getenv("LIBRARY_TELEGRAM_CHANNEL", "").strip()
 FORWARD_TEXT_CHANNEL = os.getenv("FORWARD_TEXT_CHANNEL", "").strip()
 
@@ -75,9 +82,6 @@ START_POST_MESSAGE_ID = int(os.getenv("START_POST_MESSAGE_ID", "0") or 0)
 LIBRARY_MAX_MESSAGE_ID = int(os.getenv("LIBRARY_MAX_MESSAGE_ID", "0") or 0)
 RANDOM_VIDEO_RETRIES = int(os.getenv("RANDOM_VIDEO_RETRIES", "35") or 35)
 
-POLL_TIMEOUT_SECONDS = int(os.getenv("POLL_TIMEOUT_SECONDS", "25") or 25)
-DROP_PENDING_UPDATES = os.getenv("DROP_PENDING_UPDATES", "false").lower() in {"1", "true", "yes", "on"}
-
 WATCH_VIDEO_TEXT = os.getenv("WATCH_VIDEO_TEXT", "🔞 Watch Now").strip() or "🎬 Watch Now"
 WATCH_NEXT_TEXT = os.getenv("WATCH_NEXT_TEXT", "👙 Watch Next").strip() or "⏭ Watch Next"
 JOIN_CHANNELS_TEXT = os.getenv("JOIN_CHANNELS_TEXT", "Join VIRALS").strip() or "📢 Join Viral Channel"
@@ -92,110 +96,23 @@ mongo_client = None
 mongo_db = None
 users_col = None
 channels_col = None
-mtproto_app: Client | None = None
 memory_users: set[int] = set()
 memory_channel_state: dict[str, int] = {}
 broadcast_jobs: dict[str, dict[str, Any]] = {}
 
+# Errors that mean the user is gone for good (blocked the bot, deleted their
+# account, etc) - safe to drop from the DB so future broadcasts skip them.
+USER_GONE_ERRORS = (
+    UserIsBlockedError,
+    InputUserDeactivatedError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+    PeerIdInvalidError,
+    UserIdInvalidError,
+    ChatWriteForbiddenError,
+)
 
-class TelegramAPIError(Exception):
-    def __init__(self, method: str, status: int, description: str, parameters: dict | None = None):
-        super().__init__(description)
-        self.method = method
-        self.status = status
-        self.description = description
-        self.parameters = parameters or {}
-
-    @property
-    def retry_after(self) -> int:
-        return int(self.parameters.get("retry_after") or 0)
-
-
-# Methods that don't send anything to a chat (or, for getUpdates, block on Telegram's
-# own long-poll) and so should bypass send throttling entirely.
-UNTHROTTLED_METHODS = {"getUpdates", "getMe", "deleteWebhook", "getChatMember"}
-
-# Telegram's real caps are ~30 msg/sec bot-wide and ~1 msg/sec per chat. Stay a bit
-# under both so we pace requests up front instead of tripping 429s and paying
-# whatever retry_after Telegram hands back.
-GLOBAL_RATE_PER_SEC = 25
-GLOBAL_BUCKET_CAPACITY = 20
-PER_CHAT_MIN_INTERVAL = 1.05
-
-
-class _TokenBucket:
-    def __init__(self, rate: float, capacity: float):
-        self.rate = rate
-        self.capacity = capacity
-        self.tokens = capacity
-        self.updated = time.monotonic()
-        self.lock = asyncio.Lock()
-
-    async def acquire(self) -> None:
-        async with self.lock:
-            while True:
-                now = time.monotonic()
-                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
-                self.updated = now
-                if self.tokens >= 1:
-                    self.tokens -= 1
-                    return
-                await asyncio.sleep((1 - self.tokens) / self.rate)
-
-
-class TelegramBotAPI:
-    def __init__(self, token: str):
-        self.base_url = f"https://api.telegram.org/bot{token}"
-        self.session: aiohttp.ClientSession | None = None
-        self._global_bucket = _TokenBucket(GLOBAL_RATE_PER_SEC, GLOBAL_BUCKET_CAPACITY)
-        self._chat_last_sent: dict[str, float] = {}
-        self._chat_locks: dict[str, asyncio.Lock] = {}
-
-    async def open(self) -> None:
-        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
-
-    async def close(self) -> None:
-        if self.session:
-            await self.session.close()
-
-    async def _throttle(self, method: str, payload: dict | None) -> None:
-        if method in UNTHROTTLED_METHODS:
-            return
-        await self._global_bucket.acquire()
-
-        chat_id = (payload or {}).get("chat_id")
-        if chat_id is None:
-            return
-        key = str(chat_id)
-        lock = self._chat_locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            now = time.monotonic()
-            wait = PER_CHAT_MIN_INTERVAL - (now - self._chat_last_sent.get(key, 0.0))
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._chat_last_sent[key] = time.monotonic()
-
-    async def request(self, method: str, payload: dict | None = None, _retries: int = 3) -> Any:
-        if self.session is None:
-            raise RuntimeError("Telegram session is not open")
-
-        for attempt in range(_retries + 1):
-            await self._throttle(method, payload)
-            async with self.session.post(f"{self.base_url}/{method}", json=payload or {}) as resp:
-                data = await resp.json(content_type=None)
-                if data.get("ok"):
-                    return data.get("result")
-                exc = TelegramAPIError(
-                    method=method,
-                    status=int(data.get("error_code") or resp.status),
-                    description=str(data.get("description") or "Telegram API error"),
-                    parameters=data.get("parameters") or {},
-                )
-            if exc.status == 429 and exc.retry_after and attempt < _retries:
-                logger.info("Rate limited on %s, retrying after %ss", method, exc.retry_after)
-                await asyncio.sleep(exc.retry_after)
-                continue
-            raise exc
+client = TelegramClient("diskfun_bot", API_ID, API_HASH)
 
 
 def utc_now() -> str:
@@ -232,10 +149,6 @@ def command_payload(text: str) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
-def user_from_message(message: dict) -> dict:
-    return message.get("from") or {}
-
-
 def extract_diskwala_link(text: str) -> str:
     match = re.search(r"(?:https?://)?(?:www\.)?diskwala\.com/[^\s<>)\]]+", text or "", flags=re.IGNORECASE)
     if not match:
@@ -246,58 +159,18 @@ def extract_diskwala_link(text: str) -> str:
     return link
 
 
-def message_has_media(message: dict) -> bool:
-    return any(
-        key in message
-        for key in (
-            "photo",
-            "video",
-            "animation",
-            "document",
-            "audio",
-            "voice",
-            "video_note",
-            "sticker",
-        )
-    )
-
-
-def pyrogram_message_has_media(message) -> bool:
-    return bool(getattr(message, "media", None))
-
-
 def video_caption(diskwala_link: str) -> str:
     tutorial = TUTORIAL_URL or "https://t.me/howdisk/2"
     trending = TRENDING_URL or "bitly.cx/diskwala"
     return (
-        "🎬 <b>Vdo 😍</b>\n\n"
-        "<b>🔗🔗यह रहा वीडियो लिंक 👇</b>\n\n"
-        f"{html_escape(diskwala_link)}\n\n"
-        "<b>🤔 How to Open Links? | लिंक कैसे खोलें 👇</b>\n"
-        f'<a href="{html_escape(tutorial)}">📖 View Tutorial</a>\n\n'
-        "😉<b>Daily Trending. Open 👇</b>\n"
-        f"{html_escape(trending)}"
+        "🎬 **Vdo 😍**\n\n"
+        "**🔗🔗यह रहा वीडियो लिंक 👇**\n\n"
+        f"{diskwala_link}\n\n"
+        "**🤔 How to Open Links? | लिंक कैसे खोलें 👇**\n"
+        f"[📖 View Tutorial]({tutorial})\n\n"
+        "😉**Daily Trending. Open 👇**\n"
+        f"{trending}"
     )
-
-
-def html_escape(value: str) -> str:
-    return (
-        (value or "")
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
-def chat_matches_config(chat: dict, configured: str) -> bool:
-    target = parse_chat_id(configured)
-    chat_id = chat.get("id")
-    username = (chat.get("username") or "").lstrip("@").lower()
-    if isinstance(target, int):
-        return int(chat_id or 0) == target
-    target_text = str(target).strip().lstrip("@").lower()
-    return bool(username and username == target_text)
 
 
 def parse_join_channels() -> list[dict[str, str]]:
@@ -346,44 +219,35 @@ def parse_join_channels() -> list[dict[str, str]]:
 JOIN_CHANNELS = parse_join_channels()
 
 
-def video_action_keyboard(action_text: str) -> dict:
-    rows = [[{"text": action_text, "callback_data": "video"}]]
+def video_action_keyboard(action_text: str) -> list:
+    rows = [[Button.inline(action_text, b"video")]]
     if EARN_CHANNEL_URL:
-        rows.append([{"text": EARN_CHANNEL_TEXT, "url": EARN_CHANNEL_URL}])
-    return {"inline_keyboard": rows}
+        rows.append([Button.url(EARN_CHANNEL_TEXT, EARN_CHANNEL_URL)])
+    return rows
 
 
-def start_keyboard() -> dict:
+def start_keyboard() -> list:
     return video_action_keyboard(WATCH_VIDEO_TEXT)
 
 
-def video_keyboard() -> dict:
+def video_keyboard() -> list:
     return video_action_keyboard(WATCH_NEXT_TEXT)
 
 
-def main_reply_keyboard() -> dict:
-    return {
-        "keyboard": [[
-            {"text": JOIN_CHANNELS_TEXT},
-            {"text": WATCH_VIDEO_TEXT},
-        ],[
-            {"text": JOIN_CHANNELS_TEXT},
-            {"text": WATCH_VIDEO_TEXT},
-        ],[
-            {"text": JOIN_CHANNELS_TEXT},
-            {"text": WATCH_VIDEO_TEXT},
-        ], [
-            {"text": EARN_CHANNEL_TEXT},
-        ]],
-        "resize_keyboard": True,
-        "is_persistent": True,
-    }
+def main_reply_keyboard() -> list:
+    return [
+        [Button.text(JOIN_CHANNELS_TEXT, resize=True), Button.text(WATCH_VIDEO_TEXT, resize=True)],
+        [Button.text(JOIN_CHANNELS_TEXT, resize=True), Button.text(WATCH_VIDEO_TEXT, resize=True)],
+        [Button.text(JOIN_CHANNELS_TEXT, resize=True), Button.text(WATCH_VIDEO_TEXT, resize=True)],
+        [Button.text(EARN_CHANNEL_TEXT, resize=True)],
+    ]
 
 
-def cancel_keyboard(job_id: str) -> dict:
-    return {"inline_keyboard": [[{"text": "🛑 Cancel Broadcast", "callback_data": f"cancel_broadcast:{job_id}"}]]}
+def cancel_keyboard(job_id: str) -> list:
+    return [[Button.inline("🛑 Cancel Broadcast", f"cancel_broadcast:{job_id}".encode())]]
 
 
+# ===== MONGO =====
 async def init_mongo() -> None:
     global mongo_client, mongo_db, users_col, channels_col
     if not MONGO_URI:
@@ -403,23 +267,22 @@ async def init_mongo() -> None:
     logger.info("MongoDB connected: %s.%s", MONGO_DB_NAME, MONGO_USERS_COLLECTION)
 
 
-async def save_user(user: dict) -> None:
-    if not user:
+async def save_user(user_id: int, username: str = "", first_name: str = "", last_name: str = "") -> None:
+    if not user_id:
         return
-    user_id = int(user["id"])
     if users_col is None:
-        memory_users.add(user_id)
+        memory_users.add(int(user_id))
         return
 
     now = utc_now()
     await users_col.update_one(
-        {"user_id": user_id},
+        {"user_id": int(user_id)},
         {
             "$set": {
-                "user_id": user_id,
-                "username": user.get("username"),
-                "first_name": user.get("first_name"),
-                "last_name": user.get("last_name"),
+                "user_id": int(user_id),
+                "username": username,
+                "first_name": first_name,
+                "last_name": last_name,
                 "updated_at": now,
                 f"bots.{BOT_KEY_SAFE}.bot_key": BOT_KEY,
                 f"bots.{BOT_KEY_SAFE}.bot_username": BOT_USERNAME,
@@ -430,6 +293,21 @@ async def save_user(user: dict) -> None:
             "$addToSet": {"bot_keys": BOT_KEY},
         },
         upsert=True,
+    )
+
+
+async def save_user_from_event(event) -> None:
+    try:
+        sender = await event.get_sender()
+    except Exception:
+        sender = None
+    if sender is None:
+        return
+    await save_user(
+        sender.id,
+        username=getattr(sender, "username", None) or "",
+        first_name=getattr(sender, "first_name", None) or "",
+        last_name=getattr(sender, "last_name", None) or "",
     )
 
 
@@ -526,169 +404,139 @@ async def set_library_max_message_id(message_id: int) -> None:
     await set_channel_last_message(parse_chat_id(LIBRARY_TELEGRAM_CHANNEL), int(message_id))
 
 
-async def user_joined_required_channels(api: TelegramBotAPI, user_id: int) -> bool:
+# ===== BOT LOGIC =====
+def should_delete_user_after_failure(exc: Exception) -> bool:
+    return isinstance(exc, USER_GONE_ERRORS)
+
+
+async def user_joined_required_channels(user_id: int) -> bool:
     check_channels = [c for c in JOIN_CHANNELS if c.get("check_chat")]
     if not check_channels:
         return True
 
     for channel in check_channels:
         try:
-            member = await api.request("getChatMember", {
-                "chat_id": parse_chat_id(channel["check_chat"]),
-                "user_id": user_id,
-            })
-            if member.get("status") in {"left", "kicked"}:
-                return False
-        except TelegramAPIError as exc:
-            logger.warning("Join check failed for %s: %s", channel["check_chat"], exc.description)
+            await client.get_permissions(parse_chat_id(channel["check_chat"]), user_id)
+        except UserNotParticipantError:
+            return False
+        except ChatAdminRequiredError:
+            logger.warning("Bot is not admin in %s, cannot verify join.", channel["check_chat"])
+            return False
+        except Exception as exc:
+            logger.warning("Join check failed for %s: %s", channel["check_chat"], exc)
             return False
     return True
 
 
-async def send_earn_channel(api: TelegramBotAPI, chat_id: int) -> None:
+async def send_earn_channel(chat_id: int) -> None:
     if not EARN_CHANNEL_URL:
         return
-    await api.request("sendMessage", {
-        "chat_id": chat_id,
-        "text": "💰 Join our earning channel:",
-        "reply_markup": {"inline_keyboard": [[{"text": EARN_CHANNEL_TEXT, "url": EARN_CHANNEL_URL}]]},
-    })
+    await client.send_message(
+        chat_id,
+        "💰 Join our earning channel:",
+        buttons=[[Button.url(EARN_CHANNEL_TEXT, EARN_CHANNEL_URL)]],
+    )
 
 
-async def send_join_prompt(api: TelegramBotAPI, chat_id: int) -> None:
-    await api.request("sendMessage", {
-        "chat_id": chat_id,
-        "text": "🔒 Please join the channel first, then tap Watch Video.",
-        "reply_markup": start_keyboard(),
-    })
+async def send_join_prompt(chat_id: int) -> None:
+    await client.send_message(
+        chat_id,
+        "🔒 Please join the channel first, then tap Watch Video.",
+        buttons=start_keyboard(),
+    )
 
 
-async def send_main_reply_keyboard(api: TelegramBotAPI, chat_id: int) -> None:
-    await api.request("sendMessage", {
-        "chat_id": chat_id,
-        "text": "👇 Menu",
-        "reply_markup": main_reply_keyboard(),
-    })
+async def send_main_reply_keyboard(chat_id: int) -> None:
+    await client.send_message(chat_id, "👇 Menu", buttons=main_reply_keyboard())
 
 
-async def send_start(api: TelegramBotAPI, message: dict) -> None:
-    user = user_from_message(message)
-    chat_id = int(message["chat"]["id"])
-    await save_user(user)
+async def send_start(event) -> None:
+    chat_id = event.chat_id
+    await save_user_from_event(event)
 
-    if command_payload(message.get("text") or "").lower() == "video":
-        await send_main_reply_keyboard(api, chat_id)
-        await send_random_video(api, chat_id, user)
+    if command_payload(event.raw_text or "").lower() == "video":
+        await send_main_reply_keyboard(chat_id)
+        await send_random_video(chat_id, event.sender_id)
         return
 
     start_message_id = START_POST_MESSAGE_ID or await get_channel_last_message(parse_chat_id(FORWARD_TEXT_CHANNEL))
     if FORWARD_TEXT_CHANNEL and start_message_id:
         try:
-            await api.request("copyMessage", {
-                "chat_id": chat_id,
-                "from_chat_id": parse_chat_id(FORWARD_TEXT_CHANNEL),
-                "message_id": int(start_message_id),
-                "reply_markup": start_keyboard(),
-            })
-            await send_main_reply_keyboard(api, chat_id)
-            return
-        except TelegramAPIError as exc:
-            logger.warning("Could not copy /start post: %s", exc.description)
+            source = await client.get_messages(parse_chat_id(FORWARD_TEXT_CHANNEL), ids=int(start_message_id))
+            if source:
+                await client.send_message(chat_id, source, buttons=start_keyboard())
+                await send_main_reply_keyboard(chat_id)
+                return
+        except Exception as exc:
+            logger.warning("Could not copy /start post: %s", exc)
 
-    await api.request("sendMessage", {
-        "chat_id": chat_id,
-        "text": "👋 Welcome!\n\nJoin the channel and tap Watch Video to get a random Diskwala link.",
-        "reply_markup": start_keyboard(),
-    })
-    await send_main_reply_keyboard(api, chat_id)
-
-
-def is_retryable_missing_message(exc: TelegramAPIError) -> bool:
-    text = exc.description.lower()
-    return (
-        "message to copy not found" in text
-        or "message_id_invalid" in text
-        or "message identifier is not specified" in text
-        or "message not found" in text
+    await client.send_message(
+        chat_id,
+        "👋 Welcome!\n\nJoin the channel and tap Watch Video to get a random Diskwala link.",
+        buttons=start_keyboard(),
     )
+    await send_main_reply_keyboard(chat_id)
 
 
-async def send_typing_action(api: TelegramBotAPI, chat_id: int) -> None:
-    try:
-        await api.request("sendChatAction", {"chat_id": chat_id, "action": "typing"}, _retries=0)
-    except TelegramAPIError:
-        pass
+async def send_random_video(chat_id: int, user_id: int | None = None) -> None:
+    if user_id:
+        await save_user(user_id)
 
-
-async def send_random_video(api: TelegramBotAPI, chat_id: int, user: dict | None = None) -> None:
-    if user:
-        await save_user(user)
-
-    if not await user_joined_required_channels(api, int(chat_id)):
-        await send_join_prompt(api, int(chat_id))
+    if not await user_joined_required_channels(int(chat_id)):
+        await send_join_prompt(int(chat_id))
         return
 
     if not LIBRARY_TELEGRAM_CHANNEL:
-        await api.request("sendMessage", {
-            "chat_id": chat_id,
-            "text": "⚠️ LIBRARY_TELEGRAM_CHANNEL is not configured.",
-        })
-        return
-
-    if mtproto_app is None:
-        await api.request("sendMessage", {
-            "chat_id": chat_id,
-            "text": "⚠️ Telegram reader is not ready. Please try again in a moment.",
-        })
+        await client.send_message(chat_id, "⚠️ LIBRARY_TELEGRAM_CHANNEL is not configured.")
         return
 
     max_message_id = await get_max_library_message_id()
     if max_message_id <= 0:
-        await api.request("sendMessage", {
-            "chat_id": chat_id,
-            "text": "⚠️ Library max id is missing. Admin can set it with /setmax 20000.",
-        })
+        await client.send_message(chat_id, "⚠️ Library max id is missing. Admin can set it with /setmax 20000.")
         return
 
-    asyncio.create_task(send_typing_action(api, chat_id))
+    library_chat_id = parse_chat_id(LIBRARY_TELEGRAM_CHANNEL)
 
-    for _ in range(max(1, RANDOM_VIDEO_RETRIES)):
-        message_id = random.randint(1, max_message_id)
-        try:
-            source_message = await mtproto_app.get_messages(parse_chat_id(LIBRARY_TELEGRAM_CHANNEL), message_id)
-            if not source_message or getattr(source_message, "empty", False):
+    async with client.action(chat_id, "typing"):
+        for _ in range(max(1, RANDOM_VIDEO_RETRIES)):
+            message_id = random.randint(1, max_message_id)
+            try:
+                source_message = await client.get_messages(library_chat_id, ids=message_id)
+            except FloodWaitError as exc:
+                await asyncio.sleep(exc.seconds)
+                continue
+            except Exception as exc:
+                logger.warning("Random message lookup failed for %s: %s", message_id, exc)
                 continue
 
-            source_text = getattr(source_message, "caption", None) or getattr(source_message, "text", None) or ""
+            if not source_message or not source_message.media:
+                continue
+
+            source_text = source_message.raw_text or ""
             diskwala_link = extract_diskwala_link(source_text)
-            if not diskwala_link or not pyrogram_message_has_media(source_message):
+            if not diskwala_link:
                 continue
 
-            await api.request("copyMessage", {
-                "chat_id": chat_id,
-                "from_chat_id": parse_chat_id(LIBRARY_TELEGRAM_CHANNEL),
-                "message_id": message_id,
-                "caption": video_caption(diskwala_link),
-                "parse_mode": "HTML",
-                "reply_markup": video_keyboard(),
-            })
-            return
-        except TelegramAPIError as exc:
-            if exc.retry_after:
-                await asyncio.sleep(exc.retry_after)
+            try:
+                await client.send_file(
+                    chat_id,
+                    file=source_message.media,
+                    caption=video_caption(diskwala_link),
+                    buttons=video_keyboard(),
+                    link_preview=False,
+                )
+                return
+            except FloodWaitError as exc:
+                await asyncio.sleep(exc.seconds)
                 continue
-            if is_retryable_missing_message(exc):
-                continue
-            logger.warning("Random video copy failed: %s", exc.description)
-            break
-        except Exception as exc:
-            logger.warning("Random message lookup failed for %s: %s", message_id, exc)
-            continue
+            except Exception as exc:
+                logger.warning("Random video copy failed: %s", exc)
+                break
 
-    await api.request("sendMessage", {
-        "chat_id": chat_id,
-        "text": "😕 Could not find a random media post with a Diskwala link right now. Please try again.",
-    })
+    await client.send_message(
+        chat_id,
+        "😕 Could not find a random media post with a Diskwala link right now. Please try again.",
+    )
 
 
 def broadcast_text(stats: dict[str, int], running: bool = True) -> str:
@@ -708,38 +556,14 @@ def broadcast_text(stats: dict[str, int], running: bool = True) -> str:
     )
 
 
-async def copy_or_send_broadcast(api: TelegramBotAPI, target_user_id: int, source: dict) -> None:
+async def copy_or_send_broadcast(target_user_id: int, source: dict) -> None:
     if source["type"] == "copy":
-        await api.request("copyMessage", {
-            "chat_id": target_user_id,
-            "from_chat_id": source["from_chat_id"],
-            "message_id": source["message_id"],
-        })
+        await client.send_message(target_user_id, source["message"])
         return
-
-    await api.request("sendMessage", {
-        "chat_id": target_user_id,
-        "text": source["text"],
-        "disable_web_page_preview": False,
-    })
+    await client.send_message(target_user_id, source["text"])
 
 
-def should_delete_user_after_failure(exc: TelegramAPIError) -> bool:
-    text = exc.description.lower()
-    return exc.status in {400, 403} and any(
-        phrase in text
-        for phrase in (
-            "bot was blocked",
-            "user is deactivated",
-            "chat not found",
-            "forbidden",
-            "peer_id_invalid",
-            "bad request: chat_id is empty",
-        )
-    )
-
-
-async def run_broadcast(api: TelegramBotAPI, admin_chat_id: int, status_message_id: int, source: dict) -> None:
+async def run_broadcast(admin_chat_id: int, status_message_id: int, source: dict) -> None:
     job_id = str(status_message_id)
     cancel_event = asyncio.Event()
     stats = {
@@ -756,12 +580,8 @@ async def run_broadcast(api: TelegramBotAPI, admin_chat_id: int, status_message_
     last_edit = 0.0
     try:
         try:
-            await api.request("editMessageReplyMarkup", {
-                "chat_id": admin_chat_id,
-                "message_id": status_message_id,
-                "reply_markup": cancel_keyboard(job_id),
-            })
-        except TelegramAPIError:
+            await client.edit_message(admin_chat_id, status_message_id, buttons=cancel_keyboard(job_id))
+        except Exception:
             pass
 
         async for user_id in iter_users_for_this_bot():
@@ -770,250 +590,209 @@ async def run_broadcast(api: TelegramBotAPI, admin_chat_id: int, status_message_
                 break
 
             try:
-                await copy_or_send_broadcast(api, user_id, source)
+                await copy_or_send_broadcast(user_id, source)
                 stats["sent"] += 1
-            except TelegramAPIError as exc:
-                if exc.retry_after:
-                    await asyncio.sleep(exc.retry_after)
-                    try:
-                        await copy_or_send_broadcast(api, user_id, source)
-                        stats["sent"] += 1
-                    except TelegramAPIError as retry_exc:
-                        stats["failed"] += 1
-                        if should_delete_user_after_failure(retry_exc):
-                            await remove_user_for_this_bot(user_id)
-                            stats["deleted"] += 1
-                else:
+            except FloodWaitError as exc:
+                await asyncio.sleep(exc.seconds)
+                try:
+                    await copy_or_send_broadcast(user_id, source)
+                    stats["sent"] += 1
+                except Exception as retry_exc:
                     stats["failed"] += 1
-                    if should_delete_user_after_failure(exc):
+                    if should_delete_user_after_failure(retry_exc):
                         await remove_user_for_this_bot(user_id)
                         stats["deleted"] += 1
+            except Exception as exc:
+                stats["failed"] += 1
+                if should_delete_user_after_failure(exc):
+                    await remove_user_for_this_bot(user_id)
+                    stats["deleted"] += 1
 
             stats["done"] += 1
             now = time.time()
             if now - last_edit >= 2 or stats["done"] == stats["total"]:
                 last_edit = now
                 try:
-                    await api.request("editMessageText", {
-                        "chat_id": admin_chat_id,
-                        "message_id": status_message_id,
-                        "text": broadcast_text(stats, running=True),
-                        "reply_markup": cancel_keyboard(job_id),
-                    })
-                except TelegramAPIError:
+                    await client.edit_message(
+                        admin_chat_id,
+                        status_message_id,
+                        broadcast_text(stats, running=True),
+                        buttons=cancel_keyboard(job_id),
+                    )
+                except Exception:
                     pass
 
             await asyncio.sleep(0.04)
     finally:
         broadcast_jobs.pop(job_id, None)
         try:
-            await api.request("editMessageText", {
-                "chat_id": admin_chat_id,
-                "message_id": status_message_id,
-                "text": broadcast_text(stats, running=False),
-            })
-        except TelegramAPIError:
+            await client.edit_message(admin_chat_id, status_message_id, broadcast_text(stats, running=False))
+        except Exception:
             pass
 
 
-async def start_broadcast(api: TelegramBotAPI, message: dict) -> None:
-    chat_id = int(message["chat"]["id"])
-    user_id = int((message.get("from") or {}).get("id") or 0)
+async def start_broadcast(event) -> None:
+    chat_id = event.chat_id
+    user_id = event.sender_id
     if user_id not in OWNER_CHAT_IDS:
         return
 
     if broadcast_jobs:
-        await api.request("sendMessage", {"chat_id": chat_id, "text": "⚠️ Broadcast already running."})
+        await client.send_message(chat_id, "⚠️ Broadcast already running.")
         return
 
-    reply = message.get("reply_to_message")
-    payload = command_payload(message.get("text") or message.get("caption") or "")
-    if reply:
-        source = {"type": "copy", "from_chat_id": chat_id, "message_id": int(reply["message_id"])}
+    reply_msg = await event.get_reply_message() if event.is_reply else None
+    payload = command_payload(event.raw_text or "")
+    if reply_msg:
+        source = {"type": "copy", "message": reply_msg}
     elif payload:
         source = {"type": "text", "text": payload}
     else:
-        await api.request("sendMessage", {
-            "chat_id": chat_id,
-            "text": "📣 Reply to a post with /broadcast, or use /broadcast your message.",
-        })
+        await client.send_message(chat_id, "📣 Reply to a post with /broadcast, or use /broadcast your message.")
         return
 
     total = await count_users_for_this_bot()
-    status = await api.request("sendMessage", {
-        "chat_id": chat_id,
-        "text": (
-            f"🚀 Broadcast starting\n\n"
-            f"🤖 Bot: @{BOT_USERNAME or BOT_KEY}\n"
-            f"👥 Users: {total}"
-        ),
-        "reply_markup": cancel_keyboard("pending"),
-    })
-    asyncio.create_task(run_broadcast(api, chat_id, int(status["message_id"]), source))
+    status = await client.send_message(
+        chat_id,
+        f"🚀 Broadcast starting\n\n🤖 Bot: @{BOT_USERNAME or BOT_KEY}\n👥 Users: {total}",
+        buttons=cancel_keyboard("pending"),
+    )
+    asyncio.create_task(run_broadcast(chat_id, status.id, source))
 
 
-async def handle_callback(api: TelegramBotAPI, callback: dict) -> None:
-    data = callback.get("data") or ""
-    callback_id = callback.get("id")
-    user = callback.get("from") or {}
-    message = callback.get("message") or {}
-    chat_id = int((message.get("chat") or {}).get("id") or user.get("id") or 0)
+async def handle_callback(event) -> None:
+    data = (event.data or b"").decode()
+    chat_id = event.chat_id
 
     if data == "video":
-        if callback_id:
-            await api.request("answerCallbackQuery", {"callback_query_id": callback_id, "text": "🎬 Sending video..."})
-        await send_random_video(api, chat_id, user)
+        try:
+            await event.answer("🎬 Sending video...")
+        except Exception:
+            pass
+        await send_random_video(chat_id, event.sender_id)
         return
 
     if data.startswith("cancel_broadcast:"):
-        if int(user.get("id") or 0) not in OWNER_CHAT_IDS:
-            if callback_id:
-                await api.request("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "Only admin can cancel.",
-                    "show_alert": True,
-                })
+        if event.sender_id not in OWNER_CHAT_IDS:
+            try:
+                await event.answer("Only admin can cancel.", alert=True)
+            except Exception:
+                pass
             return
         job_id = data.split(":", 1)[1]
         if job_id == "pending":
-            if callback_id:
-                await api.request("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Starting..."})
+            try:
+                await event.answer("Starting...")
+            except Exception:
+                pass
             return
         job = broadcast_jobs.get(job_id)
         if job:
             job["cancel"].set()
-            if callback_id:
-                await api.request("answerCallbackQuery", {"callback_query_id": callback_id, "text": "🛑 Cancelling..."})
-        elif callback_id:
-            await api.request("answerCallbackQuery", {"callback_query_id": callback_id, "text": "No active broadcast."})
+            try:
+                await event.answer("🛑 Cancelling...")
+            except Exception:
+                pass
+        else:
+            try:
+                await event.answer("No active broadcast.")
+            except Exception:
+                pass
 
 
-async def handle_channel_post(message: dict) -> None:
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    message_id = message.get("message_id")
-    if chat_id is None or message_id is None:
-        return
-    if chat_matches_config(chat, LIBRARY_TELEGRAM_CHANNEL):
-        await set_channel_last_message(chat_id, int(message_id), chat.get("username") or "")
-    elif chat_matches_config(chat, FORWARD_TEXT_CHANNEL):
-        await set_channel_last_message(chat_id, int(message_id), chat.get("username") or "")
-
-
-async def handle_message(api: TelegramBotAPI, message: dict) -> None:
-    text = message.get("text") or message.get("caption") or ""
+async def handle_message(event) -> None:
+    text = event.raw_text or ""
     cmd = command_name(text)
-    from_user_id = int((message.get("from") or {}).get("id") or 0)
+    chat_id = event.chat_id
+    from_user_id = event.sender_id
     normalized_text = text.strip()
 
     if cmd == "start":
-        await send_start(api, message)
+        await send_start(event)
     elif cmd == "video":
-        await send_random_video(api, int(message["chat"]["id"]), user_from_message(message))
+        await save_user_from_event(event)
+        await send_random_video(chat_id, from_user_id)
     elif normalized_text == JOIN_CHANNELS_TEXT:
-        await send_start(api, message)
+        await send_start(event)
     elif normalized_text in {WATCH_VIDEO_TEXT, WATCH_NEXT_TEXT}:
-        await send_random_video(api, int(message["chat"]["id"]), user_from_message(message))
+        await save_user_from_event(event)
+        await send_random_video(chat_id, from_user_id)
     elif normalized_text == EARN_CHANNEL_TEXT:
-        await send_earn_channel(api, int(message["chat"]["id"]))
+        await send_earn_channel(chat_id)
     elif cmd == "broadcast":
-        await start_broadcast(api, message)
+        await start_broadcast(event)
     elif cmd == "setmax" and from_user_id in OWNER_CHAT_IDS:
         payload = command_payload(text)
         if not payload.isdigit() or int(payload) <= 0:
-            await api.request("sendMessage", {
-                "chat_id": int(message["chat"]["id"]),
-                "text": "Use: /setmax 20000",
-            })
+            await client.send_message(chat_id, "Use: /setmax 20000")
             return
         await set_library_max_message_id(int(payload))
-        await api.request("sendMessage", {
-            "chat_id": int(message["chat"]["id"]),
-            "text": f"✅ Library max message id saved: {int(payload)}",
-        })
+        await client.send_message(chat_id, f"✅ Library max message id saved: {int(payload)}")
     elif cmd == "status" and from_user_id in OWNER_CHAT_IDS:
-        await api.request("sendMessage", {
-            "chat_id": int(message["chat"]["id"]),
-            "text": f"📊 Users started for @{BOT_USERNAME or BOT_KEY}: {await count_users_for_this_bot()}",
-        })
+        await client.send_message(
+            chat_id,
+            f"📊 Users started for @{BOT_USERNAME or BOT_KEY}: {await count_users_for_this_bot()}",
+        )
     elif cmd == "stats" and from_user_id in OWNER_CHAT_IDS:
-        await api.request("sendMessage", {
-            "chat_id": int(message["chat"]["id"]),
-            "text": (
+        await client.send_message(
+            chat_id,
+            (
                 f"📊 Users for @{BOT_USERNAME or BOT_KEY}: {await count_users_for_this_bot()}\n"
                 f"🔢 Library max id: {await get_max_library_message_id()}"
             ),
-        })
-    elif cmd == "exportsession" and from_user_id in OWNER_CHAT_IDS:
-        chat_id = int(message["chat"]["id"])
-        if mtproto_app is None:
-            await api.request("sendMessage", {"chat_id": chat_id, "text": "⚠️ MTProto reader is not running."})
-            return
-        try:
-            session_str = await mtproto_app.export_session_string()
-        except Exception as exc:
-            await api.request("sendMessage", {"chat_id": chat_id, "text": f"❌ Export failed: {exc}"})
-            return
-        await api.request("sendMessage", {
-            "chat_id": chat_id,
-            "text": (
-                "🔑 Session string (SECRET - grants full account access):\n\n"
-                f"<code>{html_escape(session_str)}</code>\n\n"
-                "Save this as the SESSION_STRING env var on Render, then redeploy. "
-                "Delete this message after copying it."
-            ),
-            "parse_mode": "HTML",
-        })
+        )
 
 
-def extract_update_user_id(update: dict) -> int:
-    message = update.get("message") or update.get("edited_message") or {}
-    if message:
-        return int((message.get("from") or {}).get("id") or 0)
-    callback = update.get("callback_query") or {}
-    if callback:
-        return int((callback.get("from") or {}).get("id") or 0)
-    return 0
-
-
-async def process_update(api: TelegramBotAPI, update: dict) -> None:
+# ===== EVENT HANDLERS =====
+@client.on(events.NewMessage(incoming=True))
+async def on_new_message(event):
     try:
-        if "channel_post" in update:
-            await handle_channel_post(update["channel_post"])
-        elif "edited_channel_post" in update:
-            await handle_channel_post(update["edited_channel_post"])
-        elif "callback_query" in update:
-            await handle_callback(api, update["callback_query"])
-        elif "message" in update:
-            await handle_message(api, update["message"])
-    except TelegramAPIError as exc:
-        logger.warning("Telegram API error in update %s: %s", update.get("update_id"), exc.description)
-        if should_delete_user_after_failure(exc):
-            user_id = extract_update_user_id(update)
-            if user_id:
-                await remove_user_for_this_bot(user_id)
-                logger.info("Removed blocked/deactivated user %s from db", user_id)
+        if event.is_channel and not event.is_group:
+            library_chat_id = parse_chat_id(LIBRARY_TELEGRAM_CHANNEL)
+            forward_chat_id = parse_chat_id(FORWARD_TEXT_CHANNEL)
+            if event.chat_id in (library_chat_id, forward_chat_id):
+                chat = await event.get_chat()
+                await set_channel_last_message(event.chat_id, event.id, getattr(chat, "username", "") or "")
+            return
+
+        if not event.is_private:
+            return
+
+        await handle_message(event)
+    except USER_GONE_ERRORS as exc:
+        user_id = event.sender_id
+        if user_id:
+            await remove_user_for_this_bot(user_id)
+            logger.info("Removed blocked/deactivated user %s from db", user_id)
     except Exception:
-        logger.exception("Unhandled update error: %s", update.get("update_id"))
+        logger.exception("Unhandled message error")
 
 
-async def resolve_bot_identity(api: TelegramBotAPI) -> None:
+@client.on(events.CallbackQuery())
+async def on_callback(event):
+    try:
+        await handle_callback(event)
+    except Exception:
+        logger.exception("Unhandled callback error")
+
+
+async def resolve_bot_identity() -> None:
     global BOT_KEY, BOT_KEY_SAFE, BOT_USERNAME, BOT_ID
-    me = await api.request("getMe")
-    BOT_USERNAME = (me.get("username") or "").lstrip("@")
-    BOT_ID = int(me.get("id") or 0)
+    me = await client.get_me()
+    BOT_USERNAME = me.username or ""
+    BOT_ID = int(me.id)
     if not BOT_KEY:
         BOT_KEY = BOT_USERNAME or str(BOT_ID)
     BOT_KEY_SAFE = safe_field(BOT_KEY)
     logger.info("Bot identity: @%s (%s), db key=%s", BOT_USERNAME, BOT_ID, BOT_KEY_SAFE)
 
 
-async def notify_owner(api: TelegramBotAPI, text: str) -> None:
+async def notify_owner(text: str) -> None:
     for owner_id in OWNER_CHAT_IDS:
         try:
-            await api.request("sendMessage", {"chat_id": owner_id, "text": text})
-        except TelegramAPIError as exc:
-            logger.warning("Owner notify failed for %s: %s", owner_id, exc.description)
+            await client.send_message(owner_id, text)
+        except Exception as exc:
+            logger.warning("Owner notify failed for %s: %s", owner_id, exc)
 
 
 async def start_health_server() -> aiohttp.web.AppRunner:
@@ -1028,102 +807,34 @@ async def start_health_server() -> aiohttp.web.AppRunner:
     return runner
 
 
-SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
-
-# A bot's SESSION_STRING carries login/auth only - never the resolved peer cache
-# (access_hash table), which lives in local storage and is wiped every deploy.
-# Pre-seeding these lets Pyrogram's resolve_peer find the peer in local storage
-# and skip the network resolution that fails cold for bots. Get these once via
-# scratchpad/get_access_hash.py (get_chat then storage.get_peer_by_id).
-LIBRARY_CHANNEL_ACCESS_HASH = int(os.getenv("LIBRARY_CHANNEL_ACCESS_HASH", "0") or 0)
-FORWARD_CHANNEL_ACCESS_HASH = int(os.getenv("FORWARD_CHANNEL_ACCESS_HASH", "0") or 0)
-
-# Matches pyrogram.storage.storage.Storage.SESSION_STRING_FORMAT ('>BI?256sQ?').
-# base64.urlsafe_b64decode silently drops invalid characters instead of raising,
-# so a session string mangled by copy/paste (stray quotes, whitespace, a dropped
-# line) decodes short instead of erroring - checking the byte length up front
-# catches that before it reaches pyrogram's struct.unpack and crashes the boot.
-_SESSION_STRING_BYTES = struct.calcsize(">BI?256sQ?")
-
-
-def is_valid_session_string(value: str) -> bool:
-    try:
-        padded = value + "=" * (-len(value) % 4)
-        return len(base64.urlsafe_b64decode(padded)) == _SESSION_STRING_BYTES
-    except Exception:
-        return False
-
-
-async def start_mtproto_reader() -> None:
-    global mtproto_app
-
-    client_kwargs: dict[str, Any] = dict(
-        api_id=API_ID,
-        api_hash=API_HASH,
-        bot_token=BOT_TOKEN,
-        # A bot session can only learn a private channel's access_hash from a live
-        # update (new post, being added, etc) - there is no bot-callable "resolve by
-        # id" for a chat it has never seen. no_updates=True blocks that permanently,
-        # so it must stay False for the library channel to ever become resolvable.
-        no_updates=False,
+async def resolve_peers_before_run() -> None:
+    """
+    A bot's MTProto session only learns a private channel's internals from a
+    live update or a prior resolution - there is no cold "resolve by id" for a
+    chat it has never seen. Without a persisted session/access hash (by
+    design here), this can only self-heal once the channel admin posts
+    something new while the bot is running. Non-fatal either way: the bot
+    keeps serving other commands regardless of the outcome.
+    """
+    targets = (
+        (parse_chat_id(LIBRARY_TELEGRAM_CHANNEL), "library"),
+        (parse_chat_id(FORWARD_TEXT_CHANNEL), "forward"),
     )
-    client_kwargs["in_memory"] = True
-    session_string = SESSION_STRING
-    if session_string and not is_valid_session_string(session_string):
-        logger.warning(
-            "SESSION_STRING is malformed (wrong decoded length) - ignoring it and "
-            "starting a fresh login instead. Re-copy it carefully (no quotes, no "
-            "extra whitespace/line breaks) from /exportsession and reset the env var."
-        )
-        session_string = ""
-
-    if session_string:
-        client_kwargs["session_string"] = session_string
-    else:
-        logger.warning(
-            "SESSION_STRING is not set or invalid. The MTProto peer cache will not "
-            "survive a restart/redeploy; once resolved, use /exportsession to save it."
-        )
-
-    mtproto_app = Client("viralbot_reader", **client_kwargs)
-    await mtproto_app.start()
-
-    seed_peers = []
-    library_chat_id = parse_chat_id(LIBRARY_TELEGRAM_CHANNEL)
-    forward_chat_id = parse_chat_id(FORWARD_TEXT_CHANNEL)
-    if LIBRARY_CHANNEL_ACCESS_HASH and isinstance(library_chat_id, int):
-        seed_peers.append((library_chat_id, LIBRARY_CHANNEL_ACCESS_HASH, "channel", None))
-    if FORWARD_CHANNEL_ACCESS_HASH and isinstance(forward_chat_id, int):
-        seed_peers.append((forward_chat_id, FORWARD_CHANNEL_ACCESS_HASH, "channel", None))
-    if seed_peers:
-        await mtproto_app.storage.update_peers(seed_peers)
-        logger.info("Pre-seeded %s peer(s) from configured access hashes.", len(seed_peers))
-
-    last_exc: Exception | None = None
-    for attempt in range(5):
-        try:
-            await mtproto_app.get_chat(library_chat_id)
-            last_exc = None
-            break
-        except Exception as exc:
-            last_exc = exc
-            logger.warning("Peer resolve attempt %s/5 failed: %s", attempt + 1, exc)
-            await asyncio.sleep(2 * (attempt + 1))
-
-    if last_exc is not None:
-        logger.warning(
-            "Library channel peer still unresolved after boot: %s. Set "
-            "LIBRARY_CHANNEL_ACCESS_HASH (see scratchpad/get_access_hash.py) to fix "
-            "this permanently, or wait for the channel admin to post something new "
-            "while the bot keeps running - the peer resolves automatically the "
-            "moment a live update arrives.",
-            last_exc,
-        )
-        # Keep running rather than crash-looping: mtproto_app stays set and will
-        # self-heal once a live update from the channel arrives or the access hash
-        # env var is set.
-    else:
-        logger.info("MTProto reader started; library channel peer resolved.")
+    for target, name in targets:
+        for attempt in range(5):
+            try:
+                await client.get_entity(target)
+                logger.info("Resolved %s channel peer.", name)
+                break
+            except Exception as exc:
+                logger.warning("%s channel peer resolve attempt %s/5 failed: %s", name, attempt + 1, exc)
+                await asyncio.sleep(2 * (attempt + 1))
+        else:
+            logger.warning(
+                "%s channel peer still unresolved after boot. Will self-heal once "
+                "a live update from that channel arrives.",
+                name,
+            )
 
 
 async def main() -> None:
@@ -1136,18 +847,21 @@ async def main() -> None:
     if not FORWARD_TEXT_CHANNEL:
         raise RuntimeError("FORWARD_TEXT_CHANNEL is required in .env")
 
-    api = TelegramBotAPI(BOT_TOKEN)
-    await api.open()
     health_runner = await start_health_server()
 
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
+    stopping = asyncio.Event()
 
     def _request_stop() -> None:
-        if not stop_event.is_set():
-            logger.info("Shutdown signal received.")
-            stop_event.set()
+        if not stopping.is_set():
+            stopping.set()
+            asyncio.create_task(_graceful_stop())
 
+    async def _graceful_stop() -> None:
+        logger.info("Shutdown signal received.")
+        await notify_owner(f"⏹ @{BOT_USERNAME or BOT_KEY} is stopping.")
+        await client.disconnect()
+
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, _request_stop)
@@ -1156,46 +870,26 @@ async def main() -> None:
 
     crashed_exc: Exception | None = None
     try:
-        await resolve_bot_identity(api)
-        await start_mtproto_reader()
+        await client.start(bot_token=BOT_TOKEN)
+        await resolve_bot_identity()
         await init_mongo()
-        await api.request("deleteWebhook", {"drop_pending_updates": DROP_PENDING_UPDATES})
-        await notify_owner(api, f"✅ @{BOT_USERNAME or BOT_KEY} started. No session file used.")
-
-        offset = 0
-        while not stop_event.is_set():
-            try:
-                updates = await api.request("getUpdates", {
-                    "offset": offset,
-                    "timeout": POLL_TIMEOUT_SECONDS,
-                    "allowed_updates": ["message", "callback_query", "channel_post", "edited_channel_post"],
-                })
-                for update in updates:
-                    offset = max(offset, int(update["update_id"]) + 1)
-                    asyncio.create_task(process_update(api, update))
-            except TelegramAPIError as exc:
-                if exc.retry_after:
-                    await asyncio.sleep(exc.retry_after)
-                else:
-                    logger.warning("Polling Telegram error: %s", exc.description)
-                    await asyncio.sleep(3)
-            except aiohttp.ClientError as exc:
-                logger.warning("Network error: %s", exc)
-                await asyncio.sleep(3)
+        await resolve_peers_before_run()
+        await notify_owner(f"✅ @{BOT_USERNAME or BOT_KEY} started.")
+        await client.run_until_disconnected()
     except Exception as exc:
         crashed_exc = exc
         logger.exception("Bot crashed and is not responding")
     finally:
         if crashed_exc is not None:
-            await notify_owner(api, f"🛑 @{BOT_USERNAME or BOT_KEY} crashed and is not responding: {crashed_exc}")
-        else:
-            await notify_owner(api, f"⏹ @{BOT_USERNAME or BOT_KEY} is stopping.")
-        if mtproto_app:
             try:
-                await mtproto_app.stop()
-            except Exception as exc:
-                logger.warning("MTProto client stop failed (continuing cleanup): %s", exc)
-        await api.close()
+                await notify_owner(f"🛑 @{BOT_USERNAME or BOT_KEY} crashed and is not responding: {crashed_exc}")
+            except Exception:
+                pass
+        try:
+            if client.is_connected():
+                await client.disconnect()
+        except Exception as exc:
+            logger.warning("Client disconnect failed (continuing cleanup): %s", exc)
         await health_runner.cleanup()
         if mongo_client:
             mongo_client.close()
