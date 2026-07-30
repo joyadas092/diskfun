@@ -1030,6 +1030,14 @@ async def start_health_server() -> aiohttp.web.AppRunner:
 
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
+# A bot's SESSION_STRING carries login/auth only - never the resolved peer cache
+# (access_hash table), which lives in local storage and is wiped every deploy.
+# Pre-seeding these lets Pyrogram's resolve_peer find the peer in local storage
+# and skip the network resolution that fails cold for bots. Get these once via
+# scratchpad/get_access_hash.py (get_chat then storage.get_peer_by_id).
+LIBRARY_CHANNEL_ACCESS_HASH = int(os.getenv("LIBRARY_CHANNEL_ACCESS_HASH", "0") or 0)
+FORWARD_CHANNEL_ACCESS_HASH = int(os.getenv("FORWARD_CHANNEL_ACCESS_HASH", "0") or 0)
+
 # Matches pyrogram.storage.storage.Storage.SESSION_STRING_FORMAT ('>BI?256sQ?').
 # base64.urlsafe_b64decode silently drops invalid characters instead of raising,
 # so a session string mangled by copy/paste (stray quotes, whitespace, a dropped
@@ -1080,10 +1088,21 @@ async def start_mtproto_reader() -> None:
     mtproto_app = Client("viralbot_reader", **client_kwargs)
     await mtproto_app.start()
 
+    seed_peers = []
+    library_chat_id = parse_chat_id(LIBRARY_TELEGRAM_CHANNEL)
+    forward_chat_id = parse_chat_id(FORWARD_TEXT_CHANNEL)
+    if LIBRARY_CHANNEL_ACCESS_HASH and isinstance(library_chat_id, int):
+        seed_peers.append((library_chat_id, LIBRARY_CHANNEL_ACCESS_HASH, "channel", None))
+    if FORWARD_CHANNEL_ACCESS_HASH and isinstance(forward_chat_id, int):
+        seed_peers.append((forward_chat_id, FORWARD_CHANNEL_ACCESS_HASH, "channel", None))
+    if seed_peers:
+        await mtproto_app.storage.update_peers(seed_peers)
+        logger.info("Pre-seeded %s peer(s) from configured access hashes.", len(seed_peers))
+
     last_exc: Exception | None = None
     for attempt in range(5):
         try:
-            await mtproto_app.get_chat(parse_chat_id(LIBRARY_TELEGRAM_CHANNEL))
+            await mtproto_app.get_chat(library_chat_id)
             last_exc = None
             break
         except Exception as exc:
@@ -1092,24 +1111,19 @@ async def start_mtproto_reader() -> None:
             await asyncio.sleep(2 * (attempt + 1))
 
     if last_exc is not None:
-        if SESSION_STRING:
-            # A persisted session was expected to already have this resolved; failing
-            # here means something actually broke (revoked, channel changed, etc).
-            await mtproto_app.stop()
-            raise RuntimeError(f"Could not resolve library channel peer after 5 attempts: {last_exc}")
-
         logger.warning(
-            "Library channel peer still unresolved after boot: %s. This session has "
-            "never seen a live update from it. Ask the channel admin to post anything "
-            "new while the bot keeps running - the peer resolves automatically the "
-            "moment an update arrives. Then run /exportsession and save the output as "
-            "the SESSION_STRING env var so it never has to resolve cold again.",
+            "Library channel peer still unresolved after boot: %s. Set "
+            "LIBRARY_CHANNEL_ACCESS_HASH (see scratchpad/get_access_hash.py) to fix "
+            "this permanently, or wait for the channel admin to post something new "
+            "while the bot keeps running - the peer resolves automatically the "
+            "moment a live update arrives.",
             last_exc,
         )
         # Keep running rather than crash-looping: mtproto_app stays set and will
-        # self-heal once a live update from the channel arrives.
-
-    logger.info("MTProto reader started in memory; library channel peer resolved.")
+        # self-heal once a live update from the channel arrives or the access hash
+        # env var is set.
+    else:
+        logger.info("MTProto reader started; library channel peer resolved.")
 
 
 async def main() -> None:
