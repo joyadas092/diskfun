@@ -942,6 +942,26 @@ async def handle_message(api: TelegramBotAPI, message: dict) -> None:
                 f"🔢 Library max id: {await get_max_library_message_id()}"
             ),
         })
+    elif cmd == "exportsession" and from_user_id in OWNER_CHAT_IDS:
+        chat_id = int(message["chat"]["id"])
+        if mtproto_app is None:
+            await api.request("sendMessage", {"chat_id": chat_id, "text": "⚠️ MTProto reader is not running."})
+            return
+        try:
+            session_str = await mtproto_app.export_session_string()
+        except Exception as exc:
+            await api.request("sendMessage", {"chat_id": chat_id, "text": f"❌ Export failed: {exc}"})
+            return
+        await api.request("sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                "🔑 Session string (SECRET - grants full account access):\n\n"
+                f"<code>{html_escape(session_str)}</code>\n\n"
+                "Save this as the SESSION_STRING env var on Render, then redeploy. "
+                "Delete this message after copying it."
+            ),
+            "parse_mode": "HTML",
+        })
 
 
 def extract_update_user_id(update: dict) -> int:
@@ -1006,31 +1026,38 @@ async def start_health_server() -> aiohttp.web.AppRunner:
     return runner
 
 
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+
+
 async def start_mtproto_reader() -> None:
     global mtproto_app
-    mtproto_app = Client(
-        "viralbot_reader",
+
+    client_kwargs: dict[str, Any] = dict(
         api_id=API_ID,
         api_hash=API_HASH,
         bot_token=BOT_TOKEN,
-        in_memory=True,
-        no_updates=True,
+        # A bot session can only learn a private channel's access_hash from a live
+        # update (new post, being added, etc) - there is no bot-callable "resolve by
+        # id" for a chat it has never seen. no_updates=True blocks that permanently,
+        # so it must stay False for the library channel to ever become resolvable.
+        no_updates=False,
     )
+    if SESSION_STRING:
+        client_kwargs["session_string"] = SESSION_STRING
+        client_kwargs["in_memory"] = True
+    else:
+        logger.warning(
+            "SESSION_STRING is not set. The MTProto peer cache will not survive a "
+            "restart/redeploy; once resolved, use /exportsession to save it."
+        )
+        client_kwargs["in_memory"] = True
+
+    mtproto_app = Client("viralbot_reader", **client_kwargs)
     await mtproto_app.start()
 
     last_exc: Exception | None = None
     for attempt in range(5):
         try:
-            # no_updates=True means this session never passively learns peer access_hash
-            # from live updates. For a private channel known only by numeric id, crawling
-            # dialogs once is the only way to prime Pyrogram's peer cache before get_chat
-            # can resolve it by id (fresh in_memory session, so this repeats every deploy).
-            try:
-                async for _ in mtproto_app.get_dialogs():
-                    pass
-            except Exception as dialog_exc:
-                logger.warning("Dialog crawl failed (continuing): %s", dialog_exc)
-
             await mtproto_app.get_chat(parse_chat_id(LIBRARY_TELEGRAM_CHANNEL))
             last_exc = None
             break
@@ -1040,8 +1067,22 @@ async def start_mtproto_reader() -> None:
             await asyncio.sleep(2 * (attempt + 1))
 
     if last_exc is not None:
-        await mtproto_app.stop()
-        raise RuntimeError(f"Could not resolve library channel peer after 5 attempts: {last_exc}")
+        if SESSION_STRING:
+            # A persisted session was expected to already have this resolved; failing
+            # here means something actually broke (revoked, channel changed, etc).
+            await mtproto_app.stop()
+            raise RuntimeError(f"Could not resolve library channel peer after 5 attempts: {last_exc}")
+
+        logger.warning(
+            "Library channel peer still unresolved after boot: %s. This session has "
+            "never seen a live update from it. Ask the channel admin to post anything "
+            "new while the bot keeps running - the peer resolves automatically the "
+            "moment an update arrives. Then run /exportsession and save the output as "
+            "the SESSION_STRING env var so it never has to resolve cold again.",
+            last_exc,
+        )
+        # Keep running rather than crash-looping: mtproto_app stays set and will
+        # self-heal once a live update from the channel arrives.
 
     logger.info("MTProto reader started in memory; library channel peer resolved.")
 
