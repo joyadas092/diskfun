@@ -88,8 +88,41 @@ JOIN_CHANNELS_TEXT = os.getenv("JOIN_CHANNELS_TEXT", "Join VIRALS").strip() or "
 TUTORIAL_URL = os.getenv("TUTORIAL_URL", "https://t.me/howdisk/2").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "bitly.cx/diskwala").strip()
 
-EARN_CHANNEL_TEXT = os.getenv("EARN_CHANNEL_TEXT", "💰 Earning Channel").strip() or "💰 Earning Channel"
-EARN_CHANNEL_URL = os.getenv("EARN_CHANNEL_URL", "https://t.me/+-WC_czgycbM5M2Rl").strip()
+def parse_offer_channels() -> list[dict[str, str]]:
+    """
+    Each offer button is Text|URL, semicolon separated:
+      OFFER_CHANNELS=💰 Earning Channel|https://t.me/+abc;🎰 Aviator Guide|https://t.me/+xyz
+    You can also use OFFER_CHANNEL_1, OFFER_CHANNEL_2, ... instead/as well.
+    Falls back to single OFFER_CHANNEL_URL / OFFER_CHANNEL_TEXT if none of the above are set.
+    """
+    raw_items: list[str] = []
+    if os.getenv("OFFER_CHANNELS", "").strip():
+        raw_items.extend(x.strip() for x in os.getenv("OFFER_CHANNELS", "").split(";") if x.strip())
+
+    for idx in range(1, 21):
+        item = os.getenv(f"OFFER_CHANNEL_{idx}", "").strip()
+        if item:
+            raw_items.append(item)
+
+    channels: list[dict[str, str]] = []
+    for item in raw_items:
+        parts = [p.strip() for p in item.split("|") if p.strip()]
+        if not parts:
+            continue
+        text, url = (parts[0], parts[1]) if len(parts) > 1 else ("📢 Offer Channel", parts[0])
+        channels.append({"text": text, "url": url})
+
+    if not channels:
+        url = os.getenv("OFFER_CHANNEL_URL", "").strip()
+        text = os.getenv("OFFER_CHANNEL_TEXT", "📢 Offer Channel").strip() or "📢 Offer Channel"
+        if url:
+            channels.append({"text": text, "url": url})
+
+    return channels
+
+
+OFFER_CHANNELS = parse_offer_channels()
+OFFER_CHANNEL_TEXT_MAP = {c["text"]: c for c in OFFER_CHANNELS}
 
 
 mongo_client = None
@@ -135,6 +168,23 @@ def chat_key(chat_id: int | str) -> str:
 def safe_field(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", value.strip().lstrip("@"))
     return cleaned or "unknown_bot"
+
+
+LIVEGRAM_RE = re.compile(
+    r"(?:livegram|livegrambot|bot\s+not\s+responds|this\s+bot\s+was\s+made\s+using)",
+    re.IGNORECASE,
+)
+
+
+def should_delete_livegram_message(text: str) -> bool:
+    return bool(LIVEGRAM_RE.search(text or ""))
+
+
+async def delete_message_safely(event) -> None:
+    try:
+        await event.delete()
+    except Exception as exc:
+        logger.warning("Could not delete message %s: %s", event.id, exc)
 
 
 def command_name(text: str) -> str:
@@ -221,8 +271,8 @@ JOIN_CHANNELS = parse_join_channels()
 
 def video_action_keyboard(action_text: str) -> list:
     rows = [[Button.inline(action_text, b"video")]]
-    if EARN_CHANNEL_URL:
-        rows.append([Button.url(EARN_CHANNEL_TEXT, EARN_CHANNEL_URL)])
+    for channel in OFFER_CHANNELS:
+        rows.append([Button.url(channel["text"], channel["url"])])
     return rows
 
 
@@ -235,12 +285,14 @@ def video_keyboard() -> list:
 
 
 def main_reply_keyboard() -> list:
-    return [
+    rows = [
         [Button.text(JOIN_CHANNELS_TEXT, resize=True), Button.text(WATCH_VIDEO_TEXT, resize=True)],
         [Button.text(JOIN_CHANNELS_TEXT, resize=True), Button.text(WATCH_VIDEO_TEXT, resize=True)],
         [Button.text(JOIN_CHANNELS_TEXT, resize=True), Button.text(WATCH_VIDEO_TEXT, resize=True)],
-        [Button.text(EARN_CHANNEL_TEXT, resize=True)],
     ]
+    for channel in OFFER_CHANNELS:
+        rows.append([Button.text(channel["text"], resize=True)])
+    return rows
 
 
 def cancel_keyboard(job_id: str) -> list:
@@ -428,13 +480,11 @@ async def user_joined_required_channels(user_id: int) -> bool:
     return True
 
 
-async def send_earn_channel(chat_id: int) -> None:
-    if not EARN_CHANNEL_URL:
-        return
+async def send_offer_channel(chat_id: int, channel: dict[str, str]) -> None:
     await client.send_message(
         chat_id,
-        "💰 Join our earning channel:",
-        buttons=[[Button.url(EARN_CHANNEL_TEXT, EARN_CHANNEL_URL)]],
+        "📢 Check out our offer channel:",
+        buttons=[[Button.url(channel["text"], channel["url"])]],
     )
 
 
@@ -717,8 +767,8 @@ async def handle_message(event) -> None:
     elif normalized_text in {WATCH_VIDEO_TEXT, WATCH_NEXT_TEXT}:
         await save_user_from_event(event)
         await send_random_video(chat_id, from_user_id)
-    elif normalized_text == EARN_CHANNEL_TEXT:
-        await send_earn_channel(chat_id)
+    elif normalized_text in OFFER_CHANNEL_TEXT_MAP:
+        await send_offer_channel(chat_id, OFFER_CHANNEL_TEXT_MAP[normalized_text])
     elif cmd == "broadcast":
         await start_broadcast(event)
     elif cmd == "setmax" and from_user_id in OWNER_CHAT_IDS:
@@ -758,6 +808,10 @@ async def on_new_message(event):
         if not event.is_private:
             return
 
+        if should_delete_livegram_message(event.raw_text or ""):
+            await delete_message_safely(event)
+            return
+
         await handle_message(event)
     except USER_GONE_ERRORS as exc:
         user_id = event.sender_id
@@ -791,8 +845,10 @@ async def notify_owner(text: str) -> None:
     for owner_id in OWNER_CHAT_IDS:
         try:
             await client.send_message(owner_id, text)
-        except Exception as exc:
-            logger.warning("Owner notify failed for %s: %s", owner_id, exc)
+        except Exception:
+            logger.warning(
+                "Owner notify failed for %s - owner must /start this bot at least once first.", owner_id
+            )
 
 
 async def start_health_server() -> aiohttp.web.AppRunner:
@@ -811,10 +867,9 @@ async def resolve_peers_before_run() -> None:
     """
     A bot's MTProto session only learns a private channel's internals from a
     live update or a prior resolution - there is no cold "resolve by id" for a
-    chat it has never seen. Without a persisted session/access hash (by
-    design here), this can only self-heal once the channel admin posts
-    something new while the bot is running. Non-fatal either way: the bot
-    keeps serving other commands regardless of the outcome.
+    chat it has never seen. get_dialogs() would force that, but it's
+    restricted for bot accounts, so this just retries get_entity by id and
+    self-heals once a live update from that channel arrives.
     """
     targets = (
         (parse_chat_id(LIBRARY_TELEGRAM_CHANNEL), "library"),
