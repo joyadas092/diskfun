@@ -96,12 +96,12 @@ def parse_offer_channels() -> list[dict[str, str]]:
         parts = [p.strip() for p in item.split("|") if p.strip()]
         if not parts:
             continue
-        text, url = (parts[0], parts[1]) if len(parts) > 1 else ("📢 Offer Channel", parts[0])
+        text, url = (parts[0], parts[1]) if len(parts) > 1 else ("💰 Daily Earning Channel", parts[0])
         channels.append({"text": text, "url": url})
 
     if not channels:
-        url = os.getenv("OFFER_CHANNEL_URL", "").strip()
-        text = os.getenv("OFFER_CHANNEL_TEXT", "📢 Offer Channel").strip() or "📢 Offer Channel"
+        url = os.getenv("OFFER_CHANNEL_URL", "https://t.me/+-WC_czgycbM5M2Rl").strip()
+        text = os.getenv("OFFER_CHANNEL_TEXT", "💰 Daily Earning Channel").strip() or "💰 Daily Earning Channel"
         if url:
             channels.append({"text": text, "url": url})
 
@@ -508,7 +508,7 @@ class BotRuntime:
     async def send_offer_channel(self, chat_id: int, channel: dict[str, str]) -> None:
         await self.client.send_message(
             chat_id,
-            "📢 Check out our offer channel:",
+            "💰 Join our Daily Earning Channel:",
             buttons=[[Button.url(channel["text"], channel["url"])]],
         )
 
