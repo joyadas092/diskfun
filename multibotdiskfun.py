@@ -11,6 +11,7 @@ from typing import Any
 import aiohttp.web
 from dotenv import load_dotenv
 from telethon import TelegramClient, Button, events
+from telethon.tl.types import MessageEmpty, MessageMediaWebPage, InputMediaWebPage
 from telethon.errors import (
     ChatAdminRequiredError,
     ChatWriteForbiddenError,
@@ -57,23 +58,56 @@ OWNER_CHAT_IDS = parse_owner_ids()
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 
-LIBRARY_TELEGRAM_CHANNEL = os.getenv("LIBRARY_TELEGRAM_CHANNEL", "").strip()
-FORWARD_TEXT_CHANNEL = os.getenv("FORWARD_TEXT_CHANNEL", "").strip()
+# Diskwala shared channel configs
+DISKWALA_LIBRARY_CHANNEL = (
+    os.getenv("DISKWALA_LIBRARY_CHANNEL", "").strip()
+    or os.getenv("LIBRARY_TELEGRAM_CHANNEL", "").strip()
+)
+DISKWALA_FORWARD_TEXT_CHANNEL = (
+    os.getenv("DISKWALA_FORWARD_TEXT_CHANNEL", "").strip()
+    or os.getenv("FORWARD_TEXT_CHANNEL", "").strip()
+)
+DISKWALA_START_POST_ID = int(
+    os.getenv("DISKWALA_START_POST_MESSAGE_ID", "0")
+    or os.getenv("START_POST_MESSAGE_ID", "0")
+    or 0
+)
+DISKWALA_LIBRARY_MAX_ID = int(
+    os.getenv("DISKWALA_LIBRARY_MAX_MESSAGE_ID", "0")
+    or os.getenv("LIBRARY_MAX_MESSAGE_ID", "0")
+    or 0
+)
+TUTORIAL_URL = os.getenv("TUTORIAL_URL", "https://t.me/howdisk/2").strip()
+TRENDING_URL = os.getenv("TRENDING_URL", "bitly.cx/diskwala").strip()
 
+# Terabox shared channel configs
+TERABOX_LIBRARY_CHANNEL = (
+    os.getenv("TERABOX_LIBRARY_CHANNEL", "").strip()
+    or os.getenv("TERABOX_LIBRARY_TELEGRAM_CHANNEL", "").strip()
+)
+TERABOX_FORWARD_TEXT_CHANNEL = (
+    os.getenv("TERABOX_FORWARD_TEXT_CHANNEL", "").strip()
+    or os.getenv("FORWARD_TEXT_CHANNEL", "").strip()
+)
+TERABOX_START_POST_ID = int(os.getenv("TERABOX_START_POST_MESSAGE_ID", "0") or 0)
+TERABOX_LIBRARY_MAX_ID = int(os.getenv("TERABOX_LIBRARY_MAX_MESSAGE_ID", "0") or 0)
+PROVIDER = os.getenv("PROVIDER", "terabox").strip().lower()
+LINK_PREVIEW = os.getenv("LINK_PREVIEW", "true").strip().lower() in ("true", "1", "yes")
+FOOTER_TEXT = os.getenv("FOOTER_TEXT", "").strip()
+HEADER_TEXT = os.getenv("HEADER_TEXT", "🎬 **Vdo 😍**\n\n**🔗🔗यह रहा वीडियो लिंक 👇**").strip()
+SEND_SOURCE_MEDIA = os.getenv("SEND_SOURCE_MEDIA", "false").strip().lower() in ("true", "1", "yes")
+USE_SOURCE_CAPTION = os.getenv("USE_SOURCE_CAPTION", "false").strip().lower() in ("true", "1", "yes")
+
+# Database & shared settings
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "viralbots").strip()
 MONGO_USERS_COLLECTION = os.getenv("MONGO_USERS_COLLECTION", "multi_bot_users").strip()
 MONGO_CHANNELS_COLLECTION = os.getenv("MONGO_CHANNELS_COLLECTION", "channel_state").strip()
-
-START_POST_MESSAGE_ID = int(os.getenv("START_POST_MESSAGE_ID", "0") or 0)
-LIBRARY_MAX_MESSAGE_ID = int(os.getenv("LIBRARY_MAX_MESSAGE_ID", "0") or 0)
 RANDOM_VIDEO_RETRIES = int(os.getenv("RANDOM_VIDEO_RETRIES", "35") or 35)
 
 WATCH_VIDEO_TEXT = os.getenv("WATCH_VIDEO_TEXT", "🔞 Watch Now").strip() or "🎬 Watch Now"
 WATCH_NEXT_TEXT = os.getenv("WATCH_NEXT_TEXT", "👙 Watch Next").strip() or "⏭ Watch Next"
 JOIN_CHANNELS_TEXT = os.getenv("JOIN_CHANNELS_TEXT", "Join VIRALS").strip() or "📢 Join Viral Channel"
-TUTORIAL_URL = os.getenv("TUTORIAL_URL", "https://t.me/howdisk/2").strip()
-TRENDING_URL = os.getenv("TRENDING_URL", "bitly.cx/diskwala").strip()
 
 def parse_offer_channels() -> list[dict[str, str]]:
     """
@@ -181,28 +215,122 @@ def command_payload(text: str) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
-def extract_diskwala_link(text: str) -> str:
-    match = re.search(r"(?:https?://)?(?:www\.)?diskwala\.com/[^\s<>)\]]+", text or "", flags=re.IGNORECASE)
+TERABOX_DOMAINS_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:[a-zA-Z0-9-]+\.)*(?:"
+    r"terabox\.com|teraboxapp\.com|1024tera\.com|1024terabox\.com|"
+    r"terasharefile\.com|tersharefile\.com|terasharelink\.com|teraboxlink\.com|"
+    r"terafileshare\.com|4funbox\.com|mirrobox\.com|nephobox\.com|"
+    r"momerybox\.com|tibibox\.com|freeterabox\.com|terabox\.app|terabox\.fun"
+    r")/[^\s<>)\]]+",
+    re.IGNORECASE,
+)
+
+TERABOX_KEYWORD_RE = re.compile(
+    r"https?://\S*(?:terabox|1024tera|terashare|4funbox|mirrobox|nephobox|momerybox|tibibox)\S*",
+    re.IGNORECASE,
+)
+
+GENERIC_URL_RE = re.compile(r"https?://[^\s<>)\]]+", re.IGNORECASE)
+
+
+def extract_terabox_link(text: str) -> str:
+    if not text:
+        return ""
+    match = TERABOX_DOMAINS_RE.search(text)
+    if not match:
+        match = TERABOX_KEYWORD_RE.search(text)
     if not match:
         return ""
-    link = match.group(0).rstrip(".,;:!?)\"]'")
+    link = match.group(0).rstrip(".,;:!?)\"']")
     if not link.lower().startswith(("http://", "https://")):
         link = f"https://{link}"
     return link
 
 
+def extract_diskwala_link(text: str) -> str:
+    match = re.search(r"(?:https?://)?(?:www\.)?diskwala\.com/[^\s<>)\]]+", text or "", flags=re.IGNORECASE)
+    if not match:
+        return ""
+    link = match.group(0).rstrip(".,;:!?)\"']")
+    if not link.lower().startswith(("http://", "https://")):
+        link = f"https://{link}"
+    return link
+
+
+def extract_target_link(text: str, message: Any = None, provider: str = "") -> str:
+    active_provider = provider or PROVIDER
+    raw = text or ""
+    # 1. Terabox link directly in text
+    tb = extract_terabox_link(raw)
+    if tb:
+        return tb
+
+    # 2. Check entities for hyperlinked URLs (e.g. MessageEntityTextUrl)
+    if message:
+        entities = getattr(message, "entities", None) or []
+        for ent in entities:
+            url = getattr(ent, "url", None)
+            if url:
+                tb_ent = extract_terabox_link(url)
+                if tb_ent:
+                    return tb_ent
+
+    # 3. Diskwala check if in diskwala mode
+    if active_provider == "diskwala":
+        dw = extract_diskwala_link(raw)
+        if dw:
+            return dw
+
+    # 4. In Terabox mode, fallback to any valid URL in message if domain wasn't in regex
+    if active_provider == "terabox":
+        match = GENERIC_URL_RE.search(raw)
+        if match:
+            url = match.group(0).rstrip(".,;:!?)\"']")
+            if not url.lower().startswith(("http://", "https://")):
+                url = f"https://{url}"
+            return url
+
+    return ""
+
+
+def format_post_caption(link: str, original_text: str = "", provider: str = "", footer_text: str = "") -> str:
+    active_provider = provider or PROVIDER
+    active_footer = footer_text if footer_text is not None else FOOTER_TEXT
+    if active_provider == "diskwala" and not active_footer:
+        tutorial = TUTORIAL_URL or "https://t.me/howdisk/2"
+        trending = TRENDING_URL or "bitly.cx/diskwala"
+        return (
+            "🎬 **Vdo 😍**\n\n"
+            "**🔗🔗यह रहा वीडियो लिंक 👇**\n\n"
+            f"{link}\n\n"
+            "**🤔 How to Open Links? | लिंक कैसे खोलें 👇**\n"
+            f"[📖 View Tutorial]({tutorial})\n\n"
+            "😉**Must Try Terabox Virals 👇**\n"
+            f"{trending}\n"
+            f"{trending}"
+        )
+
+    parts: list[str] = []
+    if USE_SOURCE_CAPTION and original_text:
+        parts.append(original_text.strip())
+    else:
+        if HEADER_TEXT:
+            parts.append(HEADER_TEXT)
+        if link:
+            parts.append(link)
+        elif original_text:
+            parts.append(original_text.strip())
+
+    # Footer is currently blank by default; will append if customized later via FOOTER_TEXT
+    if active_footer:
+        parts.append(active_footer)
+
+    return "\n\n".join(parts)
+
+
 def video_caption(diskwala_link: str) -> str:
-    tutorial = TUTORIAL_URL or "https://t.me/howdisk/2"
-    trending = TRENDING_URL or "bitly.cx/diskwala"
-    return (
-        "🎬 **Vdo 😍**\n\n"
-        "**🔗🔗यह रहा वीडियो लिंक 👇**\n\n"
-        f"{diskwala_link}\n\n"
-        "**🤔 How to Open Links? | लिंक कैसे खोलें 👇**\n"
-        f"[📖 View Tutorial]({tutorial})\n\n"
-        "😉**Daily Trending. Open 👇**\n"
-        f"{trending}"
-    )
+    """Legacy alias for backward compatibility."""
+    return format_post_caption(diskwala_link, provider="diskwala")
 
 
 def parse_join_channels() -> list[dict[str, str]]:
@@ -258,41 +386,98 @@ def cancel_keyboard(job_id: str) -> list:
 # ===== PER-BOT CONFIG =====
 def parse_bot_configs() -> list[dict[str, Any]]:
     """
-    Put every bot token in one list, comma/semicolon/newline separated:
-      BOT_TOKENS=111:AAA,222:BBB,333:CCC,444:DDD
-
-    All bots share OFFER_CHANNEL_URL / OFFER_CHANNEL_TEXT. Session files and
-    db bot_key are auto-derived (diskfun_bot_1, diskfun_bot_2, ... and the
-    bot's own @username once resolved).
-
-    Numbered BOT_TOKEN_1, BOT_TOKEN_2, ... or a single BOT_TOKEN are still
-    supported as a fallback if BOT_TOKENS is not set.
+    Loads bots for BOTH Diskwala and Terabox:
+    1. Diskwala bots:
+       - Configured via DISKWALA_BOT_TOKENS or BOT_TOKENS (or BOT_TOKEN_1, BOT_TOKEN_2, ...)
+       - Uses DISKWALA_LIBRARY_CHANNEL (or LIBRARY_TELEGRAM_CHANNEL)
+       - Uses session diskfun_bot_{idx}
+    2. Terabox bots:
+       - Configured via TERABOX_BOT_TOKENS (or TERABOX_BOT_TOKEN_1, TERABOX_BOT_TOKEN_2, ...)
+       - Uses TERABOX_LIBRARY_CHANNEL
+       - Uses session terafun_bot_{idx}
+    Both sets of bots run concurrently in the same process!
     """
-    tokens: list[str] = [t.strip() for t in re.split(r"[,;\r\n]+", os.getenv("BOT_TOKENS", "")) if t.strip()]
+    configs: list[dict[str, Any]] = []
 
-    if not tokens:
+    # 1. Diskwala Bots
+    raw_disk = [
+        t.strip()
+        for t in re.split(r"[,;\r\n]+", os.getenv("DISKWALA_BOT_TOKENS", "").strip() or os.getenv("BOT_TOKENS", "").strip())
+        if t.strip()
+    ]
+    if not raw_disk:
         idx = 1
         while True:
-            token = os.getenv(f"BOT_TOKEN_{idx}", "").strip()
-            if not token:
+            t = os.getenv(f"BOT_TOKEN_{idx}", "").strip()
+            if not t:
                 break
-            tokens.append(token)
+            raw_disk.append(t)
             idx += 1
+    if not raw_disk and not os.getenv("TERABOX_BOT_TOKENS", "").strip():
+        single = os.getenv("BOT_TOKEN", "").strip()
+        if single:
+            raw_disk.append(single)
 
-    if not tokens:
-        token = os.getenv("BOT_TOKEN", "").strip()
-        if token:
-            tokens.append(token)
-
-    return [
-        {
+    for idx, token in enumerate(raw_disk, start=1):
+        configs.append({
             "index": idx,
+            "provider": "diskwala",
             "token": token,
             "session": os.getenv(f"BOT_SESSION_{idx}", f"diskfun_bot_{idx}").strip(),
             "bot_key": os.getenv(f"BOT_KEY_{idx}", "").strip().lstrip("@"),
-        }
-        for idx, token in enumerate(tokens, start=1)
+            "library_channel": DISKWALA_LIBRARY_CHANNEL,
+            "forward_channel": DISKWALA_FORWARD_TEXT_CHANNEL,
+            "start_post_id": DISKWALA_START_POST_ID,
+            "library_max_id": DISKWALA_LIBRARY_MAX_ID,
+            "link_preview": False,
+            "footer_text": "",
+            "header_text": "",
+            "tutorial_url": TUTORIAL_URL,
+            "trending_url": TRENDING_URL,
+            "send_source_media": True,
+            "use_source_caption": False,
+        })
+
+    # 2. Terabox Bots
+    raw_tera = [
+        t.strip()
+        for t in re.split(r"[,;\r\n]+", os.getenv("TERABOX_BOT_TOKENS", "").strip())
+        if t.strip()
     ]
+    if not raw_tera:
+        idx = 1
+        while True:
+            t = os.getenv(f"TERABOX_BOT_TOKEN_{idx}", "").strip()
+            if not t:
+                break
+            raw_tera.append(t)
+            idx += 1
+    if not raw_tera:
+        single_tera = os.getenv("TERABOX_BOT_TOKEN", "").strip()
+        if single_tera:
+            raw_tera.append(single_tera)
+
+    for idx, token in enumerate(raw_tera, start=1):
+        configs.append({
+            "index": idx,
+            "provider": "terabox",
+            "token": token,
+            "session": os.getenv(f"TERABOX_BOT_SESSION_{idx}", f"terafun_bot_{idx}").strip(),
+            "bot_key": os.getenv(f"TERABOX_BOT_KEY_{idx}", "").strip().lstrip("@"),
+            "library_channel": TERABOX_LIBRARY_CHANNEL,
+            "forward_channel": TERABOX_FORWARD_TEXT_CHANNEL,
+            "start_post_id": TERABOX_START_POST_ID,
+            "library_max_id": TERABOX_LIBRARY_MAX_ID,
+            "link_preview": LINK_PREVIEW,
+            "footer_text": FOOTER_TEXT,
+            "header_text": HEADER_TEXT,
+            "tutorial_url": "",
+            "trending_url": "",
+            "send_source_media": SEND_SOURCE_MEDIA,
+            "use_source_caption": USE_SOURCE_CAPTION,
+        })
+
+    return configs
 
 
 # ===== SHARED MONGO (users/channel state are shared across all bots) =====
@@ -345,14 +530,19 @@ async def get_channel_last_message(chat_id: int | str) -> int:
     return int((doc or {}).get("last_message_id") or 0)
 
 
-async def get_max_library_message_id() -> int:
-    if LIBRARY_MAX_MESSAGE_ID > 0:
-        return LIBRARY_MAX_MESSAGE_ID
-    return await get_channel_last_message(parse_chat_id(LIBRARY_TELEGRAM_CHANNEL))
+async def get_max_library_message_id(channel_target: int | str = "", fallback_max: int = 0) -> int:
+    if fallback_max > 0:
+        return fallback_max
+    target = channel_target or DISKWALA_LIBRARY_CHANNEL or TERABOX_LIBRARY_CHANNEL
+    if not target:
+        return 0
+    return await get_channel_last_message(parse_chat_id(target))
 
 
-async def set_library_max_message_id(message_id: int) -> None:
-    await set_channel_last_message(parse_chat_id(LIBRARY_TELEGRAM_CHANNEL), int(message_id))
+async def set_library_max_message_id(channel_target: int | str, message_id: int) -> None:
+    target = channel_target or DISKWALA_LIBRARY_CHANNEL or TERABOX_LIBRARY_CHANNEL
+    if target:
+        await set_channel_last_message(parse_chat_id(target), int(message_id))
 
 
 def should_delete_user_after_failure(exc: Exception) -> bool:
@@ -363,14 +553,63 @@ def should_delete_user_after_failure(exc: Exception) -> bool:
 class BotRuntime:
     def __init__(self, config: dict[str, Any]) -> None:
         self.index = config["index"]
+        self.provider = config.get("provider", "diskwala")
         self.token = config["token"]
         self.bot_key = config["bot_key"]
+        self.session = config["session"]
+        self.library_channel = config.get("library_channel", "")
+        self.forward_channel = config.get("forward_channel", "")
+        self.start_post_id = config.get("start_post_id", 0)
+        self.max_library_id = config.get("library_max_id", 0)
+        self.link_preview = config.get("link_preview", False)
+        self.footer_text = config.get("footer_text", "")
+        self.header_text = config.get("header_text", "")
+        self.tutorial_url = config.get("tutorial_url", "")
+        self.trending_url = config.get("trending_url", "")
+        self.send_source_media = config.get("send_source_media", self.provider == "diskwala")
+        self.use_source_caption = config.get("use_source_caption", False)
+
         self.bot_key_safe = ""
         self.bot_username = ""
         self.bot_id = 0
-        self.client = TelegramClient(config["session"], API_ID, API_HASH)
+        self.client = TelegramClient(self.session, API_ID, API_HASH)
         self.memory_users: set[int] = set()
         self.broadcast_jobs: dict[str, dict[str, Any]] = {}
+
+    def format_caption(self, target_link: str, source_text: str = "") -> str:
+        if self.provider == "diskwala":
+            tutorial = self.tutorial_url or TUTORIAL_URL or "https://t.me/howdisk/2"
+            trending = self.trending_url or TRENDING_URL or "bitly.cx/diskwala"
+            return (
+                "🎬 **Vdo 😍**\n\n"
+                "**🔗🔗यह रहा वीडियो लिंक 👇**\n\n"
+                f"{target_link}\n\n"
+                "**🤔 How to Open Links? | लिंक कैसे खोलें 👇**\n"
+                f"[📖 View Tutorial]({tutorial})\n\n"
+                "😉**Must Try Terabox Virals 👇**\n"
+                f"{trending}\n"
+                f"{trending}"
+            )
+
+        # Terabox caption
+        parts: list[str] = []
+        if self.use_source_caption and source_text:
+            parts.append(source_text.strip())
+        else:
+            header = self.header_text or HEADER_TEXT or "🎬 **Vdo 😍**\n\n**🔗🔗यह रहा वीडियो लिंक 👇**"
+            if header:
+                parts.append(header)
+            if target_link:
+                parts.append(target_link)
+            elif source_text:
+                parts.append(source_text.strip())
+
+        # Terabox footer: currently blank by default
+        footer = self.footer_text or FOOTER_TEXT
+        if footer:
+            parts.append(footer)
+
+        return "\n\n".join(parts)
 
     # ----- keyboards -----
     def video_action_keyboard(self, action_text: str) -> list:
@@ -531,10 +770,10 @@ class BotRuntime:
             await self.send_random_video(chat_id, event.sender_id)
             return
 
-        start_message_id = START_POST_MESSAGE_ID or await get_channel_last_message(parse_chat_id(FORWARD_TEXT_CHANNEL))
-        if FORWARD_TEXT_CHANNEL and start_message_id:
+        start_message_id = self.start_post_id or (await get_channel_last_message(parse_chat_id(self.forward_channel)) if self.forward_channel else 0)
+        if self.forward_channel and start_message_id:
             try:
-                source = await self.client.get_messages(parse_chat_id(FORWARD_TEXT_CHANNEL), ids=int(start_message_id))
+                source = await self.client.get_messages(parse_chat_id(self.forward_channel), ids=int(start_message_id))
                 if source:
                     await self.client.send_message(chat_id, source, buttons=self.start_keyboard())
                     await self.send_main_reply_keyboard(chat_id)
@@ -542,9 +781,10 @@ class BotRuntime:
             except Exception as exc:
                 logger.warning("[%s] Could not copy /start post: %s", self.bot_key, exc)
 
+        service_label = "Terabox" if self.provider == "terabox" else "Diskwala"
         await self.client.send_message(
             chat_id,
-            "👋 Welcome!\n\nJoin the channel and tap Watch Video to get a random Diskwala link.",
+            f"👋 Welcome!\n\nJoin the channel and tap Watch Video to get a random {service_label} video.",
             buttons=self.start_keyboard(),
         )
         await self.send_main_reply_keyboard(chat_id)
@@ -557,42 +797,53 @@ class BotRuntime:
             await self.send_join_prompt(int(chat_id))
             return
 
-        if not LIBRARY_TELEGRAM_CHANNEL:
-            await self.client.send_message(chat_id, "⚠️ LIBRARY_TELEGRAM_CHANNEL is not configured.")
+        if not self.library_channel:
+            await self.client.send_message(
+                chat_id,
+                f"⚠️ Library channel is not configured for {self.provider} bot.",
+            )
             return
 
-        max_message_id = await get_max_library_message_id()
+        max_message_id = await get_max_library_message_id(self.library_channel, self.max_library_id)
         if max_message_id <= 0:
-            await self.client.send_message(chat_id, "⚠️ Library max id is missing. Admin can set it with /setmax 20000.")
+            await self.client.send_message(
+                chat_id,
+                f"⚠️ Library max id is missing for {self.provider} channel. Admin can set it with /setmax 20000.",
+            )
             return
 
-        library_chat_id = parse_chat_id(LIBRARY_TELEGRAM_CHANNEL)
+        library_chat_id = parse_chat_id(self.library_channel)
+        min_message_id = max(1, self.start_post_id) if (self.start_post_id and self.start_post_id < max_message_id) else 1
 
-        async with self.client.action(chat_id, "typing"):
-            for _ in range(max(1, RANDOM_VIDEO_RETRIES)):
-                message_id = random.randint(1, max_message_id)
-                try:
-                    source_message = await self.client.get_messages(library_chat_id, ids=message_id)
-                except FloodWaitError as exc:
-                    await asyncio.sleep(exc.seconds)
-                    continue
-                except Exception as exc:
-                    logger.warning("[%s] Random message lookup failed for %s: %s", self.bot_key, message_id, exc)
-                    continue
+        for _ in range(max(1, RANDOM_VIDEO_RETRIES)):
+            message_id = random.randint(min_message_id, max_message_id)
+            try:
+                source_message = await self.client.get_messages(library_chat_id, ids=message_id)
+            except FloodWaitError as exc:
+                await asyncio.sleep(exc.seconds)
+                continue
+            except Exception as exc:
+                logger.warning("[%s] Random message lookup failed for %s: %s", self.bot_key, message_id, exc)
+                continue
 
-                if not source_message or not source_message.media:
-                    continue
+            if not source_message or getattr(source_message, "empty", False) or isinstance(source_message, MessageEmpty):
+                continue
 
-                source_text = source_message.raw_text or ""
+            source_text = source_message.raw_text or source_message.message or ""
+
+            if self.provider == "diskwala":
+                # Diskwala: requires media attached and valid Diskwala link
+                if not source_message.media:
+                    continue
                 diskwala_link = extract_diskwala_link(source_text)
                 if not diskwala_link:
                     continue
-
+                caption_text = self.format_caption(diskwala_link, source_text)
                 try:
                     await self.client.send_file(
                         chat_id,
                         file=source_message.media,
-                        caption=video_caption(diskwala_link),
+                        caption=caption_text,
                         buttons=self.video_keyboard(),
                         link_preview=False,
                     )
@@ -601,13 +852,62 @@ class BotRuntime:
                     await asyncio.sleep(exc.seconds)
                     continue
                 except Exception as exc:
-                    logger.warning("[%s] Random video copy failed: %s", self.bot_key, exc)
+                    logger.warning("[%s] Diskwala video send failed: %s", self.bot_key, exc)
                     break
 
-        await self.client.send_message(
-            chat_id,
-            "😕 Could not find a random media post with a Diskwala link right now. Please try again.",
+            else:
+                # Terabox: extracts Terabox link, link_preview=True, blank footer
+                target_link = extract_target_link(source_text, source_message, provider=self.provider)
+                if not target_link:
+                    continue
+                caption_text = self.format_caption(target_link, source_text)
+                try:
+                    is_real_media = bool(source_message.media and not isinstance(source_message.media, MessageMediaWebPage))
+                    if self.send_source_media and is_real_media:
+                        await self.client.send_file(
+                            chat_id,
+                            file=source_message.media,
+                            caption=caption_text,
+                            buttons=self.video_keyboard(),
+                        )
+                    elif self.link_preview and target_link:
+                        try:
+                            # Instruct Telegram to force a large preview card
+                            await self.client.send_file(
+                                chat_id,
+                                file=InputMediaWebPage(url=target_link, force_large_media=True, optional=True),
+                                caption=caption_text,
+                                buttons=self.video_keyboard(),
+                            )
+                        except Exception as e:
+                            logger.warning("[%s] Large preview fallback: %s", self.bot_key, e)
+                            await self.client.send_message(
+                                chat_id,
+                                caption_text,
+                                buttons=self.video_keyboard(),
+                                link_preview=self.link_preview,
+                            )
+                    else:
+                        await self.client.send_message(
+                            chat_id,
+                            caption_text,
+                            buttons=self.video_keyboard(),
+                            link_preview=self.link_preview,
+                        )
+                    return
+                except FloodWaitError as exc:
+                    await asyncio.sleep(exc.seconds)
+                    continue
+                except Exception as exc:
+                    logger.warning("[%s] Terabox post send failed: %s", self.bot_key, exc)
+                    break
+
+        fail_msg = (
+            "😕 Could not find a random media post with a Diskwala link right now. Please try again."
+            if self.provider == "diskwala"
+            else "😕 Could not find a random Terabox post right now. Please try again."
         )
+        await self.client.send_message(chat_id, fail_msg)
 
     # ----- broadcast -----
     def broadcast_text(self, stats: dict[str, int], running: bool = True) -> str:
@@ -794,19 +1094,27 @@ class BotRuntime:
             if not payload.isdigit() or int(payload) <= 0:
                 await self.client.send_message(chat_id, "Use: /setmax 20000")
                 return
-            await set_library_max_message_id(int(payload))
-            await self.client.send_message(chat_id, f"✅ Library max message id saved: {int(payload)}")
+            if not self.library_channel:
+                await self.client.send_message(chat_id, f"⚠️ No library channel configured for this {self.provider} bot.")
+                return
+            await set_library_max_message_id(self.library_channel, int(payload))
+            await self.client.send_message(
+                chat_id,
+                f"✅ Library max message id saved for {self.provider} ({self.library_channel}): {int(payload)}",
+            )
         elif cmd == "status" and from_user_id in OWNER_CHAT_IDS:
             await self.client.send_message(
                 chat_id,
-                f"📊 Users started for @{self.bot_username or self.bot_key}: {await self.count_users()}",
+                f"📊 Users started for @{self.bot_username or self.bot_key} [{self.provider}]: {await self.count_users()}",
             )
         elif cmd == "stats" and from_user_id in OWNER_CHAT_IDS:
+            max_id = await get_max_library_message_id(self.library_channel, self.max_library_id) if self.library_channel else 0
             await self.client.send_message(
                 chat_id,
                 (
-                    f"📊 Users for @{self.bot_username or self.bot_key}: {await self.count_users()}\n"
-                    f"🔢 Library max id: {await get_max_library_message_id()}"
+                    f"📊 Users for @{self.bot_username or self.bot_key} [{self.provider}]: {await self.count_users()}\n"
+                    f"📁 Library channel: {self.library_channel}\n"
+                    f"🔢 Library max id: {max_id}"
                 ),
             )
 
@@ -815,9 +1123,10 @@ class BotRuntime:
         async def on_new_message(event):
             try:
                 if event.is_channel and not event.is_group:
-                    library_chat_id = parse_chat_id(LIBRARY_TELEGRAM_CHANNEL)
-                    forward_chat_id = parse_chat_id(FORWARD_TEXT_CHANNEL)
-                    if event.chat_id in (library_chat_id, forward_chat_id):
+                    library_chat_id = parse_chat_id(self.library_channel) if self.library_channel else None
+                    forward_chat_id = parse_chat_id(self.forward_channel) if self.forward_channel else None
+                    monitored_chats = {c for c in (library_chat_id, forward_chat_id) if c}
+                    if event.chat_id in monitored_chats:
                         chat = await event.get_chat()
                         await set_channel_last_message(event.chat_id, event.id, getattr(chat, "username", "") or "")
                     return
@@ -852,7 +1161,7 @@ class BotRuntime:
         if not self.bot_key:
             self.bot_key = self.bot_username or str(self.bot_id)
         self.bot_key_safe = safe_field(self.bot_key)
-        logger.info("Bot identity: @%s (%s), db key=%s", self.bot_username, self.bot_id, self.bot_key_safe)
+        logger.info("Bot identity: @%s (%s), db key=%s [%s]", self.bot_username, self.bot_id, self.bot_key_safe, self.provider)
 
     async def notify_owner(self, text: str) -> None:
         for owner_id in OWNER_CHAT_IDS:
@@ -868,10 +1177,12 @@ class BotRuntime:
     async def resolve_peers_before_run(self) -> None:
         # get_dialogs() is restricted for bot accounts (bots can't use it), so
         # channel peers can only be resolved by id directly - retry a few times.
-        targets = (
-            (parse_chat_id(LIBRARY_TELEGRAM_CHANNEL), "library"),
-            (parse_chat_id(FORWARD_TEXT_CHANNEL), "forward"),
-        )
+        targets = []
+        if self.library_channel:
+            targets.append((parse_chat_id(self.library_channel), f"library ({self.provider})"))
+        if self.forward_channel:
+            targets.append((parse_chat_id(self.forward_channel), f"forward ({self.provider})"))
+
         for target, name in targets:
             for attempt in range(5):
                 try:
@@ -895,12 +1206,12 @@ class BotRuntime:
             await self.resolve_identity()
             self.register_handlers()
             await self.resolve_peers_before_run()
-            await self.notify_owner(f"✅ @{self.bot_username or self.bot_key} started.")
+            await self.notify_owner(f"✅ @{self.bot_username or self.bot_key} [{self.provider}] started.")
             await self.client.run_until_disconnected()
         except Exception as exc:
             logger.exception("[%s] Bot crashed and is not responding", self.bot_key)
             try:
-                await self.notify_owner(f"🛑 @{self.bot_username or self.bot_key} crashed and is not responding: {exc}")
+                await self.notify_owner(f"🛑 @{self.bot_username or self.bot_key} [{self.provider}] crashed: {exc}")
             except Exception:
                 pass
         finally:
@@ -926,14 +1237,24 @@ async def start_health_server() -> aiohttp.web.AppRunner:
 async def main() -> None:
     if not API_ID or not API_HASH:
         raise RuntimeError("API_ID and API_HASH are required to read random old library messages")
-    if not LIBRARY_TELEGRAM_CHANNEL:
-        raise RuntimeError("LIBRARY_TELEGRAM_CHANNEL is required in .env")
-    if not FORWARD_TEXT_CHANNEL:
-        raise RuntimeError("FORWARD_TEXT_CHANNEL is required in .env")
 
     bot_configs = parse_bot_configs()
     if not bot_configs:
-        raise RuntimeError("No bots configured. Set BOT_TOKEN_1, BOT_TOKEN_2, ... in .env")
+        raise RuntimeError(
+            "No bots configured! Set BOT_TOKENS (for Diskwala) and/or TERABOX_BOT_TOKENS (for Terabox) in .env"
+        )
+
+    diskwala_count = sum(1 for c in bot_configs if c["provider"] == "diskwala")
+    terabox_count = sum(1 for c in bot_configs if c["provider"] == "terabox")
+
+    if diskwala_count > 0 and not any(c["library_channel"] for c in bot_configs if c["provider"] == "diskwala"):
+        raise RuntimeError("LIBRARY_TELEGRAM_CHANNEL is required in .env for Diskwala bots")
+
+    if terabox_count > 0 and not any(c["library_channel"] for c in bot_configs if c["provider"] == "terabox"):
+        raise RuntimeError("TERABOX_LIBRARY_CHANNEL is required in .env for Terabox bots")
+
+    logger.info("Initializing multi-bot runner with %d bots (%d Diskwala, %d Terabox)...",
+                len(bot_configs), diskwala_count, terabox_count)
 
     await init_mongo()
     health_runner = await start_health_server()
