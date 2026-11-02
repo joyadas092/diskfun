@@ -264,6 +264,7 @@ RUNTIME_SETTINGS: dict[str, Any] = {
     "fsub_enabled": True,
     "force_sub_channels": parse_initial_force_sub_channels(),
     "offer_channels": list(INITIAL_OFFER_CHANNELS),
+    "join_channels_text": JOIN_CHANNELS_TEXT,
     "footer_text": FOOTER_TEXT,
     "terabox_footer_text": "",
     "diskwala_footer_text": "",
@@ -363,6 +364,10 @@ def get_runtime_tutorial_url() -> str:
 
 def get_runtime_trending_url() -> str:
     return RUNTIME_SETTINGS.get("trending_url") or TRENDING_URL or "bitly.cx/diskwala"
+
+
+def get_runtime_join_channels_text() -> str:
+    return RUNTIME_SETTINGS.get("join_channels_text") or JOIN_CHANNELS_TEXT or "Join VIRALS"
 
 
 async def save_runtime_settings() -> None:
@@ -895,8 +900,9 @@ class BotRuntime:
         return self.video_action_keyboard(WATCH_NEXT_TEXT)
 
     def main_reply_keyboard(self) -> list:
-        row = [Button.text(WATCH_VIDEO_TEXT, resize=True), Button.text(WATCH_NEXT_TEXT, resize=True)]
-        rows = [row, row]
+        join_btn = get_runtime_join_channels_text()
+        row = [Button.text(join_btn, resize=True), Button.text(WATCH_VIDEO_TEXT, resize=True)]
+        rows = [row, row, row]
         offers = get_runtime_offer_channels()
         for channel in offers:
             rows.append([Button.text(channel["text"], resize=True)])
@@ -1864,6 +1870,14 @@ class BotRuntime:
             await save_runtime_settings()
             await self.client.send_message(chat_id, "✅ Cleared all offer channels.")
 
+        elif sub_cmd == "setjointext":
+            if not sub_payload:
+                await self.client.send_message(chat_id, "Usage: `/admin setjointext <button_text>`\nExample: `/admin setjointext 📢 Join Viral Channel`")
+                return
+            RUNTIME_SETTINGS["join_channels_text"] = sub_payload
+            await save_runtime_settings()
+            await self.client.send_message(chat_id, f"✅ Join Channels button text updated to: **{sub_payload}**")
+
         elif sub_cmd == "footer":
             text_out, buttons = build_admin_footer_message_and_keyboard()
             await self.client.send_message(chat_id, text_out, buttons=buttons)
@@ -1990,7 +2004,8 @@ class BotRuntime:
                 await self.send_force_sub_prompt(chat_id, missing)
                 return
             await self.send_random_video(chat_id, from_user_id)
-        elif normalized_text == JOIN_CHANNELS_TEXT:
+        join_btn_text = get_runtime_join_channels_text()
+        if normalized_text in {join_btn_text, JOIN_CHANNELS_TEXT, "Join VIRALS", "📢 Join Viral Channel"}:
             await self.send_start(event)
         elif normalized_text in {WATCH_VIDEO_TEXT, WATCH_NEXT_TEXT}:
             await self.save_user_from_event(event)
@@ -2340,6 +2355,7 @@ def build_admin_help_message_and_keyboard() -> tuple[str, list]:
         "• `/admin addoffer <Title>|<URL>` - Add offer button",
         "• `/admin deloffer <number>` - Remove offer button",
         "• `/admin clearoffers` - Clear all offers\n",
+        "• `/admin setjointext <text>` - Change 'Join Channels' button text\n",
         "**📝 Footer & Captions:**",
         "• `/admin footer` - View footer texts",
         "• `/admin setfooter <text>` - Set global footer",
